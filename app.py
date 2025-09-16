@@ -29,30 +29,23 @@ def base_client():
 supabase = base_client()
 
 # ----------------------------
-# Auth: get or create session
+# Auth
 # ----------------------------
 session = st.session_state.get("session")
-
 if not session:
     st.info("Please sign in to use friends and messaging.")
-    session = login_form(
-        url=SUPABASE_URL,
-        apiKey=SUPABASE_ANON_KEY,
-        providers=["github"]
-    )
+    session = login_form(url=SUPABASE_URL, apiKey=SUPABASE_ANON_KEY, providers=["github"])
     if session:
         st.session_state["session"] = session
 
 if not session or not session.get("user"):
     st.stop()
 
-# Session fields
 user = session["user"]
 me = user["id"]
 access_token = session.get("access_token")
 refresh_token = session.get("refresh_token", "")
 
-# Optional: logout
 logout_button(apiKey=SUPABASE_ANON_KEY)
 
 @st.cache_resource(show_spinner=False)
@@ -69,8 +62,7 @@ auth = authed_client(access_token, refresh_token)
 def _slugify(s: str, fallback: str) -> str:
     if not s:
         return fallback
-    s = s.strip().lower()
-    s = s.replace("-", "_")
+    s = s.strip().lower().replace("-", "_")
     s = re.sub(r"[^a-z0-9_]", "", s)
     s = re.sub(r"_+", "_", s).strip("_")
     return s or fallback
@@ -112,15 +104,13 @@ def ensure_profile_with_username(auth_cli, me: str, user_meta: dict) -> dict:
 
     if not prof:
         handle = _next_available_username(auth_cli, base)
-        full_name = (user_meta or {}).get("full_name")
-        avatar_url = (user_meta or {}).get("avatar_url")
         auth_cli.table("profiles").insert({
             "id": me,
             "username": handle,
-            "full_name": full_name,
-            "avatar_url": avatar_url
+            "full_name": (user_meta or {}).get("full_name"),
+            "avatar_url": (user_meta or {}).get("avatar_url")
         }).execute()
-        return {"id": me, "username": handle, "full_name": full_name, "avatar_url": avatar_url}
+        return {"id": me, "username": handle, "full_name": (user_meta or {}).get("full_name"), "avatar_url": (user_meta or {}).get("avatar_url")}
 
     current = (prof.get("username") or "").strip()
     if not current:
@@ -133,30 +123,21 @@ profile = ensure_profile_with_username(auth, me, user.get("user_metadata", {}) o
 st.info(f"Signed in as **@{profile['username']}**")
 
 # ----------------------------
-# Friends & Messaging helpers
+# Helpers (friends & chat)
 # ----------------------------
 @st.cache_data(ttl=10)
 def search_users(query: str):
     if not query:
         return []
-    # NOTE: Supabase .or_ needs a single string with comma-separated conditions.
-    # Do not include extra spaces around commas.
     cond = f"username.ilike.%{query}%,full_name.ilike.%{query}%"
-    res = auth.table("profiles")\
-        .select("id, username, full_name, avatar_url")\
-        .or_(cond)\
-        .neq("id", me)\
-        .limit(20)\
-        .execute()
+    res = auth.table("profiles").select("id, username, full_name, avatar_url").or_(cond).neq("id", me).limit(20).execute()
     return res.data or []
 
 @st.cache_data(ttl=5)
 def my_friend_requests():
-    incoming = auth.table("friends")\
-        .select("id, requester_id, addressee_id, status, created_at")\
+    incoming = auth.table("friends").select("id, requester_id, addressee_id, status, created_at")\
         .eq("addressee_id", me).eq("status", "pending").order("created_at").execute().data or []
-    outgoing = auth.table("friends")\
-        .select("id, requester_id, addressee_id, status, created_at")\
+    outgoing = auth.table("friends").select("id, requester_id, addressee_id, status, created_at")\
         .eq("requester_id", me).eq("status", "pending").order("created_at").execute().data or []
     return incoming, outgoing
 
@@ -167,11 +148,18 @@ def my_friends():
     ids = set()
     for r in acc1: ids.add(r["addressee_id"])
     for r in acc2: ids.add(r["requester_id"])
-    ids.discard(me)  # safety
-    profs = []
-    if ids:
-        profs = auth.table("profiles").select("id, username, full_name, avatar_url").in_("id", list(ids)).execute().data or []
-    return profs
+    ids.discard(me)
+    if not ids:
+        return []
+    return auth.table("profiles").select("id, username, full_name, avatar_url").in_("id", list(ids)).execute().data or []
+
+@st.cache_data(ttl=10)
+def my_added_pending():
+    rows = auth.table("friends").select("addressee_id").eq("requester_id", me).eq("status", "pending").execute().data or []
+    ids = [r["addressee_id"] for r in rows]
+    if not ids:
+        return []
+    return auth.table("profiles").select("id, username, full_name, avatar_url").in_("id", ids).execute().data or []
 
 def usernames_for_ids(ids):
     ids = list(ids or [])
@@ -185,14 +173,10 @@ def send_friend_request(other_id: str):
         st.warning("You can’t add yourself.")
         return
     try:
-        auth.table("friends").insert({
-            "requester_id": me,
-            "addressee_id": other_id,
-            "status": "pending",
-        }).execute()
-    except APIError as e:
-        # Likely unique constraint (duplicate request) or RLS
-        st.error("Could not send request (already sent, already friends, or not allowed).")
+        # Idempotent; accepts automatically if they already requested you
+        auth.rpc("upsert_friend_request", {"a": me, "b": other_id}).execute()
+    except APIError:
+        st.error("Could not add friend (check RLS / grants).")
 
 def update_request_status(req_id: int, new_status: str):
     try:
@@ -209,25 +193,17 @@ def get_or_create_conversation(other_id: str) -> str:
         if not resp.data:
             raise RuntimeError("RPC returned no data")
         return resp.data
-    except APIError as e:
-        # Most common: function not SECURITY DEFINER or RLS blocking inserts
+    except APIError:
         st.error(
-            "Couldn’t open/create the conversation. "
-            "Confirm the SQL function is SECURITY DEFINER, lives in the public schema, "
-            "and RLS isn’t forced on conversation_participants."
+            "Couldn’t open/create the conversation. Make sure the RPC is SECURITY DEFINER, "
+            "in schema public, and FORCE RLS is OFF on conversation_participants."
         )
-        # Uncomment for local debugging:
-        # st.exception(e)
         raise
 
 @st.cache_data(ttl=2)
 def load_messages(conversation_id: str, limit: int = 200):
-    res = auth.table("direct_messages")\
-        .select("id, sender_id, content, created_at")\
-        .eq("conversation_id", conversation_id)\
-        .order("created_at")\
-        .limit(limit)\
-        .execute()
+    res = auth.table("direct_messages").select("id, sender_id, content, created_at")\
+        .eq("conversation_id", conversation_id).order("created_at").limit(limit).execute()
     return res.data or []
 
 def send_message(conversation_id: str, text: str):
@@ -265,7 +241,7 @@ with tabs[0]:
             with col2:
                 if st.button("Add Friend", key=f"add_{r['id']}"):
                     send_friend_request(r["id"])
-                    st.success("Friend request sent (if allowed).")
+                    st.success("Friend added (pending until accepted).")
                     st.cache_data.clear()
 
 # --- Friend Requests
@@ -306,19 +282,27 @@ with tabs[1]:
 # --- Friends & Chats
 with tabs[2]:
     st.subheader("Friends & Chats")
+
     friends = my_friends()
+    added_pending = my_added_pending()
+
+    if added_pending:
+        with st.expander("Added (pending)"):
+            for p in added_pending:
+                label = p.get("full_name") or p.get("username") or p["id"][:8]
+                st.write(f"⏳ {label} (@{p.get('username') or p['id'][:8]}) — awaiting acceptance")
+
     if not friends:
-        st.caption("No friends yet — add some from the Find Users tab.")
+        st.caption("No accepted friends yet — add some from the Find Users tab.")
         st.stop()
 
-    # Picker
+    # Picker for accepted friends
     friend_label_map = {f["id"]: (f.get("full_name") or f.get("username") or f["id"][:8]) for f in friends}
     friend_ids = [fid for fid in friend_label_map.keys() if fid != me]
     if not friend_ids:
         st.caption("No friends available to chat.")
         st.stop()
 
-    # Persist selected friend across reruns
     default_idx = 0
     if "chat_with" in st.session_state and st.session_state["chat_with"] in friend_ids:
         default_idx = friend_ids.index(st.session_state["chat_with"])
@@ -369,4 +353,4 @@ with tabs[2]:
             send_message(convo_id, text)
             time.sleep(0.1)
             st.cache_data.clear()
-           # st.experimental_rerun()
+            st.experimental_rerun()
