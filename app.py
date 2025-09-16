@@ -265,20 +265,11 @@ def base_client():
 supabase = base_client()
 
 # ---- Require auth (session provided by your main page using streamlit_supabase_auth)
-session = st.session_state.get("session")
-
-# 2) Fallback: show login right here if missing
-if not session:
+#session = st.session_state.get("session")
+if not session or not session.get("user"):
     st.info("Please sign in to use friends and messaging.")
-    session = login_form(
-        url=SUPABASE_URL,
-        apiKey=SUPABASE_ANON_KEY,
-        providers=["github"]
-    )
-    if session:
-        st.session_state["session"] = session  # ✅ hydrate global state
-if not session:
     st.stop()
+
 user = session["user"]
 me = user["id"]
 
