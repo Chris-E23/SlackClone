@@ -245,19 +245,9 @@ if session:
             st.warning("Please enter a message")
     
     st.divider()
-    st.divider()
-    # You already have:
-# session = st.session_state["session"]
-# auth = authed_client(session["access_token"], session.get("refresh_token",""))
-user = session["user"]
-me = user["id"]
-user_meta = user.get("user_metadata", {}) or {}
-profile = ensure_profile_with_username(auth, me, user_meta)
-# 👀 Display the username prominently
-st.info(f"Your username: **@{profile['username']}**")
-st.divider()
-# Messages display section
-st.subheader("📨 Recent Messages")
+  
+    # Messages display section
+    st.subheader("📨 Recent Messages")
     
     try:
         # Create authenticated client for reading messages
@@ -341,6 +331,17 @@ st.caption("🚀 Longhorn Preflight - Streamlit + Supabase MVP with streamlit-su
 
 st.set_page_config(page_title="Friends & Messages", page_icon="💬", layout="wide")
 st.title("💬 Friends & Messages")
+# You already have:
+# session = st.session_state["session"]
+# auth = authed_client(session["access_token"], session.get("refresh_token",""))
+user = session["user"]
+me = user["id"]
+user_meta = user.get("user_metadata", {}) or {}
+
+profile = ensure_profile_with_username(auth, me, user_meta)
+
+# 👀 Display the username prominently
+st.info(f"Your username: **@{profile['username']}**")
 
 # ---- Reuse your env/secrets
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
