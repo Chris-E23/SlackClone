@@ -11,6 +11,89 @@ from dotenv import load_dotenv
 from datetime import datetime
 import time
 from streamlit_supabase_auth import login_form, logout_button
+import re
+import random
+import string
+
+
+def _slugify(s: str, fallback: str) -> str:
+    if not s:
+        return fallback
+    s = s.strip().lower()
+    s = s.replace("-", "_")
+    s = re.sub(r"[^a-z0-9_]", "", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or fallback
+
+def _rand_suffix(n=3) -> str:
+    # consonants-only to stay readable
+    alphabet = "bcdfghjklmnpqrstvwxyz0123456789"
+    return "".join(random.choice(alphabet) for _ in range(n))
+
+def _username_available(auth_cli, handle: str) -> bool:
+    # Citext or not, we check exact equality
+    res = auth_cli.table("profiles").select("id").eq("username", handle).limit(1).execute()
+    return not bool(res.data)
+
+def _next_available_username(auth_cli, base: str, max_tries: int = 50) -> str:
+    # Try base, then base + numeric / short rand suffixes
+    if _username_available(auth_cli, base):
+        return base
+    # Try base + number
+    for i in range(2, 20):
+        cand = f"{base}{i}"
+        if _username_available(auth_cli, cand):
+            return cand
+    # Fall back to short randoms
+    for _ in range(max_tries):
+        cand = f"{base}{_rand_suffix(3)}"
+        if _username_available(auth_cli, cand):
+            return cand
+    # Last resort: base + 6 random
+    while True:
+        cand = f"{base}{_rand_suffix(6)}"
+        if _username_available(auth_cli, cand):
+            return cand
+
+def ensure_profile_with_username(auth_cli, me: str, user_meta: dict) -> dict:
+    """
+    Ensures a profile row exists AND has a unique username.
+    Returns the profile row (id, username, full_name, avatar_url).
+    """
+    # Load profile
+    prof = auth_cli.table("profiles").select("id, username, full_name, avatar_url")\
+        .eq("id", me).limit(1).execute().data
+    prof = prof[0] if prof else None
+
+    # derive base from GitHub / email / uid
+    gh_handle = (user_meta or {}).get("preferred_username") or (user_meta or {}).get("user_name")
+    email = (user_meta or {}).get("email")
+    fallback = f"user_{me[:8]}"
+    base = _slugify(gh_handle or (email.split("@")[0] if email else "") or "", fallback=fallback)
+    if len(base) < 3:
+        base = f"user_{me[:6]}"
+
+    if not prof:
+        # Need to create row with a unique username
+        handle = _next_available_username(auth_cli, base)
+        full_name = (user_meta or {}).get("full_name")
+        avatar_url = (user_meta or {}).get("avatar_url")
+        insert = auth_cli.table("profiles").insert({
+            "id": me,
+            "username": handle,
+            "full_name": full_name,
+            "avatar_url": avatar_url
+        }).execute()
+        return {"id": me, "username": handle, "full_name": full_name, "avatar_url": avatar_url}
+
+    # Profile exists; if username missing/blank, set one
+    current = (prof.get("username") or "").strip()
+    if not current:
+        handle = _next_available_username(auth_cli, base)
+        auth_cli.table("profiles").update({"username": handle}).eq("id", me).execute()
+        prof["username"] = handle
+    return prof
+
 
 # Page config
 st.set_page_config(
