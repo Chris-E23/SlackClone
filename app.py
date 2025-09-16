@@ -147,7 +147,6 @@ def _file_ext(mimetype: str) -> str:
     return mimetypes.guess_extension(mimetype or "") or ".bin"
 
 def upload_avatar_to_storage(auth_cli, user_id: str, file_bytes: bytes, mimetype: str) -> str:
-   def upload_avatar_to_storage(auth_cli, user_id: str, file_bytes: bytes, mimetype: str) -> str:
     """
     Upload avatar to 'avatars' bucket and return a public URL.
     Uses a unique path, so no need for upsert headers (avoids header-type errors).
