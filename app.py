@@ -10,7 +10,6 @@ import streamlit as st
 from supabase import create_client
 from postgrest import APIError
 from streamlit_supabase_auth import login_form, logout_button
-from streamlit_autorefresh import st_autorefresh  # auto-refresh
 
 # ----------------------------
 # Config & base client
@@ -18,8 +17,6 @@ from streamlit_autorefresh import st_autorefresh  # auto-refresh
 st.set_page_config(page_title="Friends & Messages", page_icon="💬", layout="wide")
 st.title("💬 Friends & Messages")
 
-# Auto-refresh every 5 seconds (adjust interval as needed)
-st_autorefresh(interval=5000, key="chat_autorefresh")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
