@@ -147,15 +147,26 @@ def _file_ext(mimetype: str) -> str:
     return mimetypes.guess_extension(mimetype or "") or ".bin"
 
 def upload_avatar_to_storage(auth_cli, user_id: str, file_bytes: bytes, mimetype: str) -> str:
-    ext = _file_ext(mimetype)
+   def upload_avatar_to_storage(auth_cli, user_id: str, file_bytes: bytes, mimetype: str) -> str:
+    """
+    Upload avatar to 'avatars' bucket and return a public URL.
+    Uses a unique path, so no need for upsert headers (avoids header-type errors).
+    """
+    ext = _file_ext(mimetype or "application/octet-stream")
     path = f"{user_id}/avatar-{int(time.time())}{ext}"
-    # upload to public bucket 'avatars'
+
+    # IMPORTANT: don't pass boolean upsert; some clients turn it into a bad header.
     auth_cli.storage.from_("avatars").upload(
         path=path,
         file=file_bytes,
-        file_options={"contentType": mimetype, "upsert": True},
+        file_options={
+            "contentType": mimetype or "application/octet-stream",
+            # "cacheControl": "3600",  # optional, must be a string if you add it
+            # no upsert flag needed since path is unique
+        },
     )
-    # public URL (for public bucket)
+
+    # Public bucket: direct URL; for private, use create_signed_url instead.
     return auth_cli.storage.from_("avatars").get_public_url(path)
 
 def avatar_img(url: str | None, size: int = 28) -> str:
