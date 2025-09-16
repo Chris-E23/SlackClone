@@ -57,6 +57,21 @@ def authed_client(access_token: str, refresh_token: str):
 
 auth = authed_client(access_token, refresh_token)
 
+
+st.markdown("""
+    <style>
+    .chat-box {
+        max-height: 400px; /* adjust height */
+        overflow-y: auto;
+        padding: 0.5rem;
+        border: 1px solid #ddd;
+        border-radius: 0.5rem;
+        background-color: #fafafa;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+
 # ----------------------------
 # Unique username bootstrap
 # ----------------------------
@@ -454,6 +469,8 @@ with tabs[2]:
 
     st.divider()
     st.markdown("**Messages**")
+    st.markdown('<div class="chat-box">', unsafe_allow_html=True)
+
     if not msgs:
         st.caption("No messages yet. Say hi!")
 
@@ -480,3 +497,4 @@ with tabs[2]:
                     st.session_state["optimistic"][selected_convo_id] = [x for x in lst if x["id"] != m["id"]]
                     st.cache_data.clear()
         st.write("---")
+        st.markdown('</div>', unsafe_allow_html=True)
