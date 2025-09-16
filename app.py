@@ -10,10 +10,13 @@ import streamlit as st
 from supabase import create_client
 from postgrest import APIError
 from streamlit_supabase_auth import login_form, logout_button
+from streamlit_autorefresh import st_autorefresh
 
 # ----------------------------
 # Config & base client
 # ----------------------------
+st_autorefresh(interval=1000, key="chat_autorefresh")
+
 st.set_page_config(page_title="Friends & Messages", page_icon="💬", layout="wide")
 st.title("💬 Friends & Messages")
 
@@ -361,6 +364,7 @@ with tabs[2]:
 
     friend_label_map = {f["id"]: (f.get("full_name") or f.get("username") or f["id"][:8]) for f in friends}
     friend_ids = [fid for fid in friend_label_map.keys() if fid != me]
+
     if not friend_ids:
         st.caption("No friends available to chat.")
         st.stop()
