@@ -467,13 +467,14 @@ with tabs[2]:
     msgs = combined_messages(selected_convo_id, server_msgs)
     id_map = usernames_for_ids({m["sender_id"] for m in msgs} | {me})
 
-    st.divider()
-    st.markdown("**Messages**")
+st.divider()
+st.markdown("**Messages**")
+
+with st.container():
     st.markdown('<div class="chat-box">', unsafe_allow_html=True)
 
     if not msgs:
         st.caption("No messages yet. Say hi!")
-
     for m in msgs:
         mine = (m["sender_id"] == me)
         who = "You" if mine else f"@{id_map.get(m['sender_id'], m['sender_id'][:8])}"
@@ -484,6 +485,7 @@ with tabs[2]:
         badge = " ⏳" if status == "sending" else (" ✅" if status == "sent" else (" ⚠️" if status == "failed" else ""))
 
         st.markdown(f"{bubble} **{who}** · {ts}{badge}\n\n{m['content']}")
+
         if status == "failed" and mine:
             cols2 = st.columns([1,1,6])
             with cols2[0]:
@@ -497,4 +499,5 @@ with tabs[2]:
                     st.session_state["optimistic"][selected_convo_id] = [x for x in lst if x["id"] != m["id"]]
                     st.cache_data.clear()
         st.write("---")
-        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
