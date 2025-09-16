@@ -14,7 +14,10 @@ from streamlit_supabase_auth import login_form, logout_button
 import re
 import random
 import string
+import os
 
+import streamlit as st
+from supabase import create_client
 
 def _slugify(s: str, fallback: str) -> str:
     if not s:
@@ -242,7 +245,19 @@ if session:
             st.warning("Please enter a message")
     
     st.divider()
-    
+    st.divider()
+    # You already have:
+# session = st.session_state["session"]
+# auth = authed_client(session["access_token"], session.get("refresh_token",""))
+    user = session["user"]
+    me = user["id"]
+    user_meta = user.get("user_metadata", {}) or {}
+
+    profile = ensure_profile_with_username(auth, me, user_meta)
+
+    # 👀 Display the username prominently
+    st.info(f"Your username: **@{profile['username']}**")
+st.divider()
     # Messages display section
     st.subheader("📨 Recent Messages")
     
@@ -324,12 +339,7 @@ st.divider()
 st.caption("🚀 Longhorn Preflight - Streamlit + Supabase MVP with streamlit-supabase-auth")
 
 # pages/10_Friends_and_Messages.py
-import os
-import time
-from datetime import datetime, timezone
 
-import streamlit as st
-from supabase import create_client
 
 st.set_page_config(page_title="Friends & Messages", page_icon="💬", layout="wide")
 st.title("💬 Friends & Messages")
