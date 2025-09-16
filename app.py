@@ -249,17 +249,15 @@ if session:
     # You already have:
 # session = st.session_state["session"]
 # auth = authed_client(session["access_token"], session.get("refresh_token",""))
-    user = session["user"]
-    me = user["id"]
-    user_meta = user.get("user_metadata", {}) or {}
-
-    profile = ensure_profile_with_username(auth, me, user_meta)
-
-    # 👀 Display the username prominently
-    st.info(f"Your username: **@{profile['username']}**")
+user = session["user"]
+me = user["id"]
+user_meta = user.get("user_metadata", {}) or {}
+profile = ensure_profile_with_username(auth, me, user_meta)
+# 👀 Display the username prominently
+st.info(f"Your username: **@{profile['username']}**")
 st.divider()
-    # Messages display section
-    st.subheader("📨 Recent Messages")
+# Messages display section
+st.subheader("📨 Recent Messages")
     
     try:
         # Create authenticated client for reading messages
