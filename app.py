@@ -10,14 +10,12 @@ import streamlit as st
 from supabase import create_client
 from postgrest import APIError
 from streamlit_supabase_auth import login_form, logout_button
-from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
 
 # ----------------------------
 # Config
 # ----------------------------
 st.set_page_config(page_title="Friends & Messages", page_icon="💬", layout="wide")
 st.title("💬 Friends & Messages")
-st_autorefresh(interval=5000, key="chat_autorefresh")  # auto-refresh every 5s
 
 # Scrollable chat box style
 st.markdown("""
