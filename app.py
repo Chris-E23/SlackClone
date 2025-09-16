@@ -10,10 +10,22 @@ import streamlit as st
 from supabase import create_client
 from postgrest import APIError
 from streamlit_supabase_auth import login_form, logout_button
+from strealit.components.v1 import html
+
+# Call this once near the top of your app after auth:
+html("""
+<script>
+  if (window.location.hash && window.location.hash.includes("access_token")) {
+    // Replace the current URL without the hash (no new history entry)
+    history.replaceState(null, document.title, window.location.pathname + window.location.search);
+  }
+</script>
+""", height=0)
 
 # ----------------------------
 # Config
 # ----------------------------
+
 st.set_page_config(page_title="Friends & Messages", page_icon="💬", layout="wide")
 st.title("💬 Friends & Messages")
 
