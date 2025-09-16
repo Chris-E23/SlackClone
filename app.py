@@ -187,9 +187,14 @@ def update_request_status(req_id: int, new_status: str):
     auth.table("friends").update({"status": new_status}).eq("id", req_id).execute()
 
 def get_or_create_conversation(other_id: str) -> str:
+    if other_id == me:
+        st.error("You can’t start a conversation with yourself.")
+        raise RuntimeError("self-conversation blocked in UI")
+
+    # call the RPC
     resp = auth.rpc("get_or_create_conversation", {"a": me, "b": other_id}).execute()
     if not resp.data:
-        raise RuntimeError("Could not create conversation")
+        raise RuntimeError("RPC returned no data")
     return resp.data
 
 @st.cache_data(ttl=2)
