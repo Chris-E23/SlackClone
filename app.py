@@ -10,15 +10,16 @@ import streamlit as st
 from supabase import create_client
 from postgrest import APIError
 from streamlit_supabase_auth import login_form, logout_button
-from streamlit_autorefresh import st_autorefresh
+from streamlit_autorefresh import st_autorefresh  # 👈 auto-refresh
 
 # ----------------------------
 # Config & base client
 # ----------------------------
-st_autorefresh(interval=1000, key="chat_autorefresh")
-
 st.set_page_config(page_title="Friends & Messages", page_icon="💬", layout="wide")
 st.title("💬 Friends & Messages")
+
+# Auto-refresh every 5 seconds (adjust interval as needed)
+st_autorefresh(interval=5000, key="chat_autorefresh")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
@@ -364,7 +365,6 @@ with tabs[2]:
 
     friend_label_map = {f["id"]: (f.get("full_name") or f.get("username") or f["id"][:8]) for f in friends}
     friend_ids = [fid for fid in friend_label_map.keys() if fid != me]
-
     if not friend_ids:
         st.caption("No friends available to chat.")
         st.stop()
@@ -394,7 +394,7 @@ with tabs[2]:
         if st.button("Refresh"):
             st.cache_data.clear()
 
-    # Server messages first
+    # Server messages
     server_msgs = load_messages(convo_id)
 
     # Composer with optimistic send
@@ -405,7 +405,7 @@ with tabs[2]:
             tmp = add_optimistic_message(convo_id, me, text.strip())  # show immediately
             ok = send_message_to_db(convo_id, text)                    # push to DB
             mark_optimistic(convo_id, tmp["id"], "sent" if ok else "failed")
-            st.cache_data.clear()                                      # next render can show server echo
+            st.cache_data.clear()                                      # next rerun shows server echo
 
     # Merge server + optimistic for display
     msgs = combined_messages(convo_id, server_msgs)
@@ -436,7 +436,6 @@ with tabs[2]:
                     st.cache_data.clear()
             with cols2[1]:
                 if st.button("Dismiss", key=f"dismiss_{m['id']}"):
-                    # remove this optimistic message
                     lst = _optimistic_list(convo_id)
                     st.session_state["optimistic"][convo_id] = [x for x in lst if x["id"] != m["id"]]
                     st.cache_data.clear()
