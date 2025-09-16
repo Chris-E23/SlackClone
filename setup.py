@@ -1,325 +1,245 @@
-#!/usr/bin/env python3
-"""
-Longhorn Preflight - Automated Setup Script
-Guides you through the complete setup process with validation
-"""
-
+# pages/10_Friends_and_Messages.py
 import os
-import sys
-import subprocess
-import shutil
-import platform
-from pathlib import Path
+import time
+from datetime import datetime, timezone
 
-# Colors for output
-class Colors:
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    BLUE = '\033[94m'
-    BOLD = '\033[1m'
-    END = '\033[0m'
+import streamlit as st
+from supabase import create_client
 
-def print_step(step_num, title):
-    print(f"\n{Colors.BLUE}{Colors.BOLD}=== Step {step_num}: {title} ==={Colors.END}")
+st.set_page_config(page_title="Friends & Messages", page_icon="💬", layout="wide")
+st.title("💬 Friends & Messages")
 
-def print_success(msg):
-    print(f"{Colors.GREEN}✅ {msg}{Colors.END}")
+# ---- Reuse your env/secrets
+SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    st.error("Missing Supabase credentials")
+    st.stop()
 
-def print_warning(msg):
-    print(f"{Colors.YELLOW}⚠️  {msg}{Colors.END}")
+@st.cache_resource
+def base_client():
+    return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-def print_error(msg):
-    print(f"{Colors.RED}❌ {msg}{Colors.END}")
+supabase = base_client()
 
-def print_info(msg):
-    print(f"{Colors.BLUE}ℹ️  {msg}{Colors.END}")
+# ---- Require auth (session provided by your main page using streamlit_supabase_auth)
+session = st.session_state.get("session")
+if not session or not session.get("user"):
+    st.info("Please sign in to use friends and messaging.")
+    st.stop()
 
-def ask_yes_no(question, default="y"):
-    choices = "[Y/n]" if default.lower() == "y" else "[y/N]"
-    while True:
-        answer = input(f"{question} {choices}: ").strip().lower()
-        if not answer:
-            return default.lower() == "y"
-        if answer in ['y', 'yes']:
-            return True
-        elif answer in ['n', 'no']:
-            return False
-        print("Please answer 'y' or 'n'")
+user = session["user"]
+me = user["id"]
 
-def check_venv():
-    """Check if we're in a virtual environment"""
-    return hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)
+@st.cache_resource(show_spinner=False)
+def authed_client(access_token: str, refresh_token: str):
+    cli = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    cli.auth.set_session(access_token, refresh_token or "")
+    return cli
 
-def check_ai_cli_environment():
-    """Check if running in a recommended AI CLI environment"""
-    # Check for Claude Code
-    if os.getenv('CLAUDE_CODE_SESSION') or os.getenv('ANTHROPIC_CLI'):
-        return "Claude Code"
-    
-    # Check for OpenAI CLI
-    if os.getenv('OPENAI_CLI') or os.getenv('OPENAI_API_KEY'):
-        return "OpenAI CLI"
-    
-    # Check for Gemini CLI
-    if os.getenv('GEMINI_CLI') or os.getenv('GOOGLE_AI_STUDIO'):
-        return "Gemini CLI"
-    
-    # Check if we're in a known AI CLI context by terminal
-    term_program = os.getenv('TERM_PROGRAM', '').lower()
-    if 'claude' in term_program or 'anthropic' in term_program:
-        return "Claude Code"
-    elif 'openai' in term_program:
-        return "OpenAI CLI"
-    elif 'gemini' in term_program or 'google' in term_program:
-        return "Gemini CLI"
-    
-    # For now, assume any sophisticated terminal might be an AI CLI
-    # This is permissive to avoid false negatives
-    if os.getenv('TERM_PROGRAM') or os.getenv('SSH_CLIENT'):
-        return "Unknown AI CLI"
-    
-    return None
+auth = authed_client(session.get("access_token"), session.get("refresh_token"))
 
-def check_windows_environment():
-    """Check if running on Windows (not WSL)"""
-    if platform.system() == 'Windows':
-        # Check if it's WSL by looking for WSL-specific indicators
-        if os.path.exists('/proc/version'):
-            with open('/proc/version', 'r') as f:
-                if 'microsoft' in f.read().lower() or 'wsl' in f.read().lower():
-                    return False  # This is WSL, not native Windows
-        return True  # Native Windows
-    return False
+# ---------- Helpers
 
-def check_dependencies():
-    """Check if required packages are installed"""
-    try:
-        import streamlit
-        import supabase
-        import dotenv
-        import streamlit_supabase_auth
-        return True
-    except ImportError:
-        return False
+def ensure_profile_row():
+    # On first login you might want to insert your own profile row
+    prof = auth.table("profiles").select("id").eq("id", me).limit(1).execute().data
+    if not prof:
+        username_guess = (user.get("user_metadata", {}) or {}).get("user_name") or user.get("email", "").split("@")[0]
+        full_name = (user.get("user_metadata", {}) or {}).get("full_name")
+        auth.table("profiles").insert({
+            "id": me,
+            "username": username_guess,
+            "full_name": full_name,
+            "avatar_url": (user.get("user_metadata", {}) or {}).get("avatar_url"),
+        }).execute()
 
-def run_test(test_name, test_command):
-    """Run a test and return True if successful"""
-    print(f"🧪 Running {test_name}...")
-    try:
-        result = subprocess.run(test_command, shell=True, capture_output=True, text=True)
-        if result.returncode == 0:
-            print_success(f"{test_name} passed")
-            return True
-        else:
-            print_error(f"{test_name} failed:")
-            print(result.stdout)
-            print(result.stderr)
-            return False
-    except Exception as e:
-        print_error(f"Error running {test_name}: {e}")
-        return False
+ensure_profile_row()
 
-def read_readme_section(section_tag):
-    """Extract a section from README.md using tags"""
-    # This would read sections marked with tags in README.md
-    # For now, return instruction text
-    sections = {
-        "supabase_setup": """
-1. Go to https://supabase.com/dashboard
-2. Create a new project (free tier)
-3. Go to Settings → API and copy:
-   - Project URL (e.g., https://kgcsphajdxnhquskfsdb.supabase.co)
-   - anon public key (long JWT token)
-4. Edit your .env file with these values
-""",
-        "github_oauth": """
-1. Go to https://github.com/settings/developers
-2. Click "New OAuth App"
-3. Fill in:
-   - Application name: Longhorn Preflight
-   - Homepage URL: http://localhost:8501
-   - Authorization callback URL: {SUPABASE_URL}/auth/v1/callback
-4. Register and save Client ID and Client Secret
-""",
-        "supabase_auth": """
-1. In Supabase Dashboard: Authentication → Providers
-2. Click on GitHub and Enable it
-3. Enter your GitHub Client ID and Client Secret
-4. Go to Authentication → URL Configuration:
-   - Site URL: http://localhost:8501
-   - Redirect URLs: http://localhost:8501/
-"""
+@st.cache_data(ttl=10)
+def search_users(query: str):
+    if not query:
+        return []
+    # simple ilike match on username or full_name
+    res = auth.table("profiles")\
+        .select("id, username, full_name, avatar_url")\
+        .or_(f"username.ilike.%{query}%,full_name.ilike.%{query}%")\
+        .neq("id", me)\
+        .limit(20)\
+        .execute()
+    return res.data or []
+
+@st.cache_data(ttl=5)
+def my_friend_requests():
+    # incoming pending requests for me
+    incoming = auth.table("friends")\
+        .select("id, requester_id, addressee_id, status, created_at")\
+        .eq("addressee_id", me).eq("status", "pending").order("created_at").execute().data or []
+    # outgoing pending
+    outgoing = auth.table("friends")\
+        .select("id, requester_id, addressee_id, status, created_at")\
+        .eq("requester_id", me).eq("status", "pending").order("created_at").execute().data or []
+    return incoming, outgoing
+
+@st.cache_data(ttl=10)
+def my_friends():
+    # accepted friendships: either direction, give me other user ids
+    acc1 = auth.table("friends").select("requester_id, addressee_id").eq("requester_id", me).eq("status", "accepted").execute().data or []
+    acc2 = auth.table("friends").select("requester_id, addressee_id").eq("addressee_id", me).eq("status", "accepted").execute().data or []
+    ids = set()
+    for r in acc1: ids.add(r["addressee_id"])
+    for r in acc2: ids.add(r["requester_id"])
+    profs = []
+    if ids:
+        profs = auth.table("profiles").select("id, username, full_name, avatar_url").in_("id", list(ids)).execute().data or []
+    return profs
+
+def get_or_create_conversation(other_id: str) -> str:
+    resp = auth.rpc("get_or_create_conversation", {"a": me, "b": other_id}).execute()
+    if not resp.data:
+        raise RuntimeError("Could not create conversation")
+    return resp.data
+
+@st.cache_data(ttl=2)
+def load_messages(conversation_id: str, limit: int = 200):
+    res = auth.table("direct_messages")\
+        .select("id, sender_id, content, created_at")\
+        .eq("conversation_id", conversation_id)\
+        .order("created_at")\
+        .limit(limit)\
+        .execute()
+    return res.data or []
+
+def send_message(conversation_id: str, text: str):
+    text = (text or "").strip()
+    if not text:
+        return
+    auth.table("direct_messages").insert({
+        "conversation_id": conversation_id,
+        "sender_id": me,
+        "content": text
+    }).execute()
+
+def send_friend_request(other_id: str):
+    auth.table("friends").insert({
+        "requester_id": me,
+        "addressee_id": other_id,
+        "status": "pending",
+    }).execute()
+
+def update_request_status(req_id: int, new_status: str):
+    auth.table("friends").update({"status": new_status}).eq("id", req_id).execute()
+
+# ---------- UI
+
+tabs = st.tabs(["Find Users", "Friend Requests", "Friends & Chats"])
+
+with tabs[0]:
+    st.subheader("Find Users")
+    q = st.text_input("Search by username or full name", "", placeholder="e.g. chris, jane doe")
+    results = search_users(q) if q else []
+    if results:
+        for r in results:
+            col1, col2 = st.columns([3,1])
+            with col1:
+                name = r.get("full_name") or r.get("username") or r["id"][:8]
+                st.write(f"**{name}**  \n`{r['id']}`")
+            with col2:
+                if st.button("Add Friend", key=f"add_{r['id']}"):
+                    send_friend_request(r["id"])
+                    st.success("Friend request sent.")
+                    st.cache_data.clear()
+
+with tabs[1]:
+    st.subheader("Friend Requests")
+    incoming, outgoing = my_friend_requests()
+
+    st.markdown("**Incoming**")
+    if not incoming:
+        st.caption("No incoming requests.")
+    for req in incoming:
+        rid = req["id"]; from_id = req["requester_id"]
+        prof = auth.table("profiles").select("username, full_name").eq("id", from_id).limit(1).execute().data
+        name = (prof[0]["full_name"] or prof[0]["username"]) if prof else from_id[:8]
+        c1, c2, c3 = st.columns([3,1,1])
+        c1.write(f"**{name}**  \n`{from_id}`")
+        if c2.button("Accept", key=f"acc_{rid}"):
+            update_request_status(rid, "accepted")
+            st.success("Accepted.")
+            st.cache_data.clear()
+        if c3.button("Decline", key=f"dec_{rid}"):
+            update_request_status(rid, "declined")
+            st.info("Declined.")
+            st.cache_data.clear()
+
+    st.markdown("---")
+    st.markdown("**Outgoing**")
+    if not outgoing:
+        st.caption("No outgoing requests.")
+    for req in outgoing:
+        to_id = req["addressee_id"]
+        prof = auth.table("profiles").select("username, full_name").eq("id", to_id).limit(1).execute().data
+        name = (prof[0]["full_name"] or prof[0]["username"]) if prof else to_id[:8]
+        st.write(f"Sent to **{name}**  (`{to_id}`) — *pending*")
+
+with tabs[2]:
+    st.subheader("Friends & Chats")
+
+    friends = my_friends()
+    if not friends:
+        st.caption("No friends yet — add some from the Find Users tab.")
+        st.stop()
+
+    # Choose a friend
+    friend_label_map = {
+        f["id"]: (f.get("full_name") or f.get("username") or f["id"][:8])
+        for f in friends
     }
-    return sections.get(section_tag, "Section not found")
+    friend_ids = list(friend_label_map.keys())
+    default_idx = 0
+    if "chat_with" in st.session_state and st.session_state["chat_with"] in friend_ids:
+        default_idx = friend_ids.index(st.session_state["chat_with"])
 
-def main():
-    print(f"{Colors.BOLD}🚀 Longhorn Preflight Setup{Colors.END}")
-    print("This script will guide you through the complete setup process.\n")
+    selected_id = st.selectbox(
+        "Choose a friend to chat with",
+        friend_ids,
+        index=default_idx,
+        format_func=lambda i: friend_label_map[i]
+    )
+    st.session_state["chat_with"] = selected_id
 
-    # Check development environment
-    print_step(0, "Development Environment Check")
-    
-    # Check if running in AI CLI
-    ai_cli = check_ai_cli_environment()
-    if not ai_cli:
-        print_warning("You don't appear to be running in a recommended AI coding environment!")
-        print_info("This project is designed to work with AI coding assistants:")
-        print("• Claude Code CLI (Anthropic): https://docs.anthropic.com/en/docs/claude-code/setup")
-        print("• OpenAI Codex CLI: https://developers.openai.com/codex/cli/")
-        print("• Google Gemini CLI: https://cloud.google.com/gemini/docs/codeassist/gemini-cli")
-        print()
-        print_warning("Without an AI assistant, you'll need to manually follow the README.")
-        
-        if not ask_yes_no("Continue without AI coding assistant? (not recommended)", "n"):
-            print("Setup cancelled. Please install a recommended AI coding tool first.")
-            return 1
-    else:
-        print_success(f"AI coding environment detected: {ai_cli}")
+    # Ensure there is a conversation
+    convo_id = get_or_create_conversation(selected_id)
 
-    # Check for native Windows (recommend WSL)
-    if check_windows_environment():
-        print_warning("You're running on native Windows!")
-        print_info("AI coding tools work best on Linux-based systems.")
-        print_info("For the best experience, install Windows Subsystem for Linux (WSL):")
-        print("• WSL Install Guide: https://learn.microsoft.com/en-us/windows/wsl/install")
-        print("• Run: wsl --install")
-        print("• Then run this setup script inside WSL")
-        print()
-        
-        if not ask_yes_no("Continue on native Windows? (not recommended)", "n"):
-            print("Setup cancelled. Please install and use WSL for the best experience.")
-            return 1
-        print_warning("Continuing on Windows - you may encounter compatibility issues")
-    else:
-        os_name = platform.system()
-        if os_name == "Linux":
-            # Check if WSL
-            if os.path.exists('/proc/version'):
-                try:
-                    with open('/proc/version', 'r') as f:
-                        version_info = f.read().lower()
-                        if 'microsoft' in version_info or 'wsl' in version_info:
-                            print_success("WSL environment detected (recommended)")
-                        else:
-                            print_success("Linux environment detected (recommended)")
-                except:
-                    print_success("Linux environment detected (recommended)")
-            else:
-                print_success("Linux environment detected (recommended)")
-        elif os_name == "Darwin":
-            print_success("macOS environment detected (recommended)")
+    # Messages list (simple polling; refresh button)
+    cols = st.columns([4,1])
+    with cols[0]:
+        st.markdown(f"**Conversation:** `{convo_id}`")
+    with cols[1]:
+        if st.button("Refresh"):
+            st.cache_data.clear()
 
-    # Check virtual environment
-    print()
-    print_info("Checking Python environment...")
-    
-    if not check_venv():
-        print_warning("You're not in a virtual environment!")
-        print_info("It's highly recommended to use a virtual environment.")
-        print_info("Run these commands first:")
-        print("  python -m venv venv")
-        print("  source venv/bin/activate  # On Windows: venv\\Scripts\\activate")
-        
-        if not ask_yes_no("Continue without virtual environment? (not recommended)", "n"):
-            print("Setup cancelled. Please set up a virtual environment first.")
-            return 1
-    else:
-        print_success("Virtual environment detected")
+    msgs = load_messages(convo_id)
 
-    # Check dependencies
-    if not check_dependencies():
-        print_info("Installing dependencies...")
-        if subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]).returncode != 0:
-            print_error("Failed to install dependencies")
-            return 1
-        print_success("Dependencies installed")
-    else:
-        print_success("Dependencies already installed")
+    st.divider()
+    st.markdown("**Messages**")
+    if not msgs:
+        st.caption("No messages yet. Say hi!")
 
-    # Step 1: Environment file
-    print_step(1, "Environment Configuration")
-    
-    if not os.path.exists(".env"):
-        if os.path.exists("dot.env.example"):
-            shutil.copy("dot.env.example", ".env")
-            print_success("Created .env from dot.env.example")
-        else:
-            # Create basic .env file
-            with open(".env", "w") as f:
-                f.write("SUPABASE_URL=your_supabase_project_url_here\n")
-                f.write("SUPABASE_ANON_KEY=your_supabase_anon_key_here\n")
-                f.write("APP_URL=http://localhost:8501\n")
-            print_success("Created .env file")
-    else:
-        print_success(".env file already exists")
+    for m in msgs:
+        mine = (m["sender_id"] == me)
+        who = "You" if mine else friend_label_map.get(m["sender_id"], m["sender_id"][:8])
+        ts = datetime.fromisoformat(m["created_at"].replace("Z","+00:00")).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        st.markdown(f"{'🟦' if mine else '🟨'} **{who}** · {ts}\n\n{m['content']}")
+        st.write("---")
 
-    # Step 2: Supabase setup
-    print_step(2, "Supabase Setup")
-    print(read_readme_section("supabase_setup"))
-    
-    if not ask_yes_no("Have you completed the Supabase setup and updated .env?"):
-        print_warning("Please complete Supabase setup first, then run this script again.")
-        return 1
-
-    # Test Supabase connection
-    if not run_test("Supabase connection", "python test_connection.py"):
-        print_error("Supabase connection failed. Check your .env file.")
-        return 1
-
-    # Step 3: GitHub OAuth
-    print_step(3, "GitHub OAuth App Setup")
-    print(read_readme_section("github_oauth"))
-    
-    if not ask_yes_no("Have you created the GitHub OAuth app?"):
-        print_warning("Please create GitHub OAuth app first, then run this script again.")
-        return 1
-
-    # Test OAuth setup
-    if not run_test("GitHub OAuth", "python test_oauth.py"):
-        print_warning("GitHub OAuth test failed, but continuing...")
-
-    # Step 4: Supabase Auth Configuration
-    print_step(4, "Supabase Auth Configuration")
-    print(read_readme_section("supabase_auth"))
-    
-    if not ask_yes_no("Have you configured GitHub auth in Supabase?"):
-        print_warning("Please configure GitHub auth in Supabase first, then run this script again.")
-        return 1
-
-    # Test database operations
-    if not run_test("Database operations", "python test_db_operations.py"):
-        print_warning("Database test failed - this might be normal if schema isn't created yet")
-
-    # Step 5: Database Schema
-    print_step(5, "Database Schema")
-    print("Now you need to create the database schema:")
-    print("1. Go to Supabase Dashboard → Database → SQL Editor")
-    print("2. Copy and paste the contents of schema.sql")
-    print("3. Click 'Run' - you should see 'Success. No rows returned'")
-    
-    if not ask_yes_no("Have you run the schema.sql in Supabase?"):
-        print_warning("Please run schema.sql in Supabase first, then run this script again.")
-        return 1
-
-    # Final test
-    if run_test("Database operations (with schema)", "python test_db_operations.py"):
-        print_success("Database schema configured correctly")
-
-    # Step 6: Ready to run
-    print_step(6, "Ready to Launch!")
-    print_success("Setup complete! 🎉")
-    print("\nTo start the application:")
-    print(f"  {Colors.BOLD}streamlit run app.py{Colors.END}")
-    print("\nThen:")
-    print("1. Open http://localhost:8501")
-    print("2. Click 'Sign up with github'")
-    print("3. Authenticate and test posting messages")
-
-    if ask_yes_no("Start the application now?"):
-        subprocess.run([sys.executable, "-m", "streamlit", "run", "app.py"])
-
-    return 0
-
-if __name__ == "__main__":
-    sys.exit(main())
+    # Composer
+    with st.form("composer", clear_on_submit=True):
+        text = st.text_area("Message", placeholder="Type a message…", height=80, max_chars=2000)
+        sent = st.form_submit_button("Send", type="primary")
+        if sent and text.strip():
+            send_message(convo_id, text)
+            # light debounce
+            time.sleep(0.1)
+            st.cache_data.clear()
+            st.experimental_rerun()
