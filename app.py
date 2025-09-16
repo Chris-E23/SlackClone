@@ -385,19 +385,10 @@ with tabs[2]:
         st.stop()
     all_member_ids = {u for c in convs for u in c.get("members", [])}
     uname_map = usernames_for_ids(all_member_ids)
-       # Conversation list
-    convs = my_conversations()
-    if not convs:
-        st.caption("No conversations yet.")
-        st.stop()
-
-    all_member_ids = {u for c in convs for u in c.get("members", [])}
-    uname_map = usernames_for_ids(all_member_ids)
 
     conv_options = {c["id"]: convo_label(c, uname_map) for c in convs}
     conv_ids = list(conv_options.keys())
 
-    # Persist selection
     current = st.session_state.get("current_convo")
     default_index = 0
     if current in conv_ids:
