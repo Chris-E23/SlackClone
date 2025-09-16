@@ -3,10 +3,12 @@
 Slackclone with Supabase + Streamlit
 - GitHub auth (streamlit-supabase-auth)
 - Profile bootstrap with unique usernames
-- Friends (search, requests)
-- DMs + Group chats (list all conversations)
-- Messages panel (center) with fixed-height scroll (HTML iframe)
+- Friends (search, requests, accept/decline)
+- DMs + Group chats
 - Optimistic messaging (⏳/✅/⚠️)
+- 3-column layout: Left (friends & convos), Center (messages), Right (profile)
+- Scrollable message panel (HTML iframe)
+- Avatars via Supabase Storage (bucket 'avatars')
 """
 
 import os
@@ -14,6 +16,7 @@ import re
 import uuid
 import random
 import time
+import mimetypes
 import html as py_html
 from datetime import datetime, timezone
 
@@ -29,7 +32,7 @@ from streamlit.components.v1 import html
 st.set_page_config(page_title="Slackclone", page_icon="💬", layout="wide")
 st.title("💬 Slackclone")
 
-# (Optional) scrub access tokens from URL fragment if present
+# Scrub access tokens in URL hash if present
 html("""
 <script>
   if (window.location.hash && window.location.hash.includes("access_token")) {
@@ -55,7 +58,7 @@ supabase = base_client()
 # =========================
 session = st.session_state.get("session")
 if not session:
-    st.info("Please sign in")
+    st.info("Please sign in to use the app.")
     session = login_form(url=SUPABASE_URL, apiKey=SUPABASE_ANON_KEY, providers=["github"])
     if session:
         st.session_state["session"] = session
@@ -138,6 +141,33 @@ profile = ensure_profile_with_username(auth, me, user.get("user_metadata", {}) o
 st.caption(f"Signed in as **@{profile['username']}**")
 
 # =========================
+# Avatars (Storage helpers)
+# =========================
+def _file_ext(mimetype: str) -> str:
+    return mimetypes.guess_extension(mimetype or "") or ".bin"
+
+def upload_avatar_to_storage(auth_cli, user_id: str, file_bytes: bytes, mimetype: str) -> str:
+    ext = _file_ext(mimetype)
+    path = f"{user_id}/avatar-{int(time.time())}{ext}"
+    # upload to public bucket 'avatars'
+    auth_cli.storage.from_("avatars").upload(
+        path=path,
+        file=file_bytes,
+        file_options={"contentType": mimetype, "upsert": True},
+    )
+    # public URL (for public bucket)
+    return auth_cli.storage.from_("avatars").get_public_url(path)
+
+def avatar_img(url: str | None, size: int = 28) -> str:
+    if not url:
+        # simple placeholder circle
+        return f"<div style='width:{size}px;height:{size}px;border-radius:50%;background:#ddd;display:inline-block;border:1px solid #eee;vertical-align:middle;'></div>"
+    return (
+        f"<img src='{py_html.escape(url)}' width='{size}' height='{size}' "
+        f"style='border-radius:50%;object-fit:cover;vertical-align:middle;border:1px solid #eee'/>"
+    )
+
+# =========================
 # Optimistic messaging
 # =========================
 if "optimistic" not in st.session_state:
@@ -168,7 +198,7 @@ def mark_optimistic(cid: str, temp_id: str, new_status: str):
             return
 
 def drop_delivered_optimistic(cid: str, server_msgs: list):
-    """hide optimistic copies when an equivalent server message appears (same sender+content within 10s)"""
+    """Hide optimistic copies once an equivalent server message arrives (same sender+content within 10s)."""
     lst = _optimistic_list(cid)
     keep = []
     for om in lst:
@@ -225,12 +255,18 @@ def usernames_for_ids(ids):
     rows = auth.table("profiles").select("id, username").in_("id", ids).execute().data or []
     return {r["id"]: (r["username"] or r["id"][:8]) for r in rows}
 
+def profiles_for_ids(ids):
+    ids = list(ids or [])
+    if not ids: return {}
+    rows = auth.table("profiles").select("id, username, avatar_url").in_("id", ids).execute().data or []
+    return {r["id"]: r for r in rows}
+
 def send_friend_request(other_id: str):
     try:
-        # idempotent helper RPC that accepts if reverse-pending exists
+        # prefer idempotent RPC if you created it
         auth.rpc("upsert_friend_request", {"a": me, "b": other_id}).execute()
     except APIError:
-        # fallback simple insert if RPC missing
+        # fallback: simple insert
         auth.table("friends").insert({"requester_id": me, "addressee_id": other_id, "status": "pending"}).execute()
 
 def update_request_status(req_id: int, new_status: str):
@@ -251,7 +287,6 @@ def create_group(others: list[str], title: str) -> str:
 
 @st.cache_data(ttl=5)
 def my_conversations():
-    # list all convos I participate in
     cps = auth.table("conversation_participants").select("conversation_id").eq("user_id", me).execute().data or []
     conv_ids = [c["conversation_id"] for c in cps]
     if not conv_ids: return []
@@ -275,11 +310,29 @@ def convo_label(convo, usernames_map):
         handles = [f"@{usernames_map.get(u, u[:8])}" for u in others][:3]
         tail = "" if len(others) <= 3 else f" +{len(others)-3}"
         return "👥 " + ", ".join(handles) + tail
-    # DM: show the other handle
+    # DM: show other
     others = [u for u in convo.get("members", []) if u != me]
-    if not others: return "DM"
+    if not others: return "💬 DM"
     other = others[0]
-    return f"💬 @{usernames_map.get(other, other[:8])}"
+    return f"💬 @{usernames_for_ids([other]).get(other, other[:8])}"
+
+def convo_label_with_avatar(convo, usernames_map, profile_map) -> str:
+    if convo.get("is_group"):
+        others = [u for u in convo.get("members", [])]
+        urls = [profile_map.get(u, {}).get("avatar_url") for u in others][:2]
+        imgs = "".join(f"<span style='margin-right:-6px;'>{avatar_img(u, 18)}</span>" for u in urls if u)
+        base = (convo.get("title") or "").strip()
+        if not base:
+            handles = [f"@{usernames_map.get(u, u[:8])}" for u in others if u != me][:3]
+            tail = "" if len(others) <= 3 else f" +{len(others)-3}"
+            base = ", ".join(handles) + tail if handles else "Group"
+        return f"{imgs} <span>👥 {py_html.escape(base)}</span>"
+    # DM
+    others = [u for u in convo.get("members", []) if u != me]
+    other = others[0] if others else None
+    if not other:
+        return f"{avatar_img(None, 18)} <span>💬 DM</span>"
+    return f"{avatar_img(profile_map.get(other, {}).get('avatar_url'), 18)} <span>💬 @{py_html.escape(usernames_map.get(other, other[:8]))}</span>"
 
 @st.cache_data(ttl=2)
 def load_messages(conversation_id: str, limit: int = 200):
@@ -299,15 +352,15 @@ def send_message_to_db(conversation_id: str, text: str) -> bool:
         return False
 
 # =========================
-# Layout: Left (friends & convos) / Center (messages)
+# Layout: Left / Center / Right
 # =========================
-col_left, col_main = st.columns([1, 2])
+col_left, col_main, col_right = st.columns([1, 2, 1])
 
 # ---------- Left: Friends & Conversations ----------
 with col_left:
     st.subheader("👥 Friends & Conversations")
 
-    # Search users
+    # Find users
     with st.expander("Find users"):
         q = st.text_input("Search", "", placeholder="username or name")
         results = search_users(q) if q else []
@@ -316,7 +369,10 @@ with col_left:
             name = r.get("full_name") or r.get("username") or r["id"][:8]
             handle = r.get("username") or r["id"][:8]
             cols = st.columns([2,1])
-            cols[0].markdown(f"**{name}**  \n`@{handle}`")
+            cols[0].markdown(
+                f"{avatar_img(r.get('avatar_url'), 24)} **{py_html.escape(name)}**  \n`@{py_html.escape(handle)}`",
+                unsafe_allow_html=True
+            )
             if cols[1].button("Add", key=f"add_{r['id']}"):
                 send_friend_request(r["id"])
                 st.success("Request sent")
@@ -330,9 +386,10 @@ with col_left:
             st.caption("None")
         for req in incoming:
             rid = req["id"]; from_id = req["requester_id"]
-            uname = usernames_for_ids([from_id]).get(from_id, from_id[:8])
+            prof = profiles_for_ids([from_id]).get(from_id, {})
+            uname = prof.get("username") or from_id[:8]
             cols = st.columns([2,1,1])
-            cols[0].markdown(f"@{uname}")
+            cols[0].markdown(f"{avatar_img(prof.get('avatar_url'), 20)} @{py_html.escape(uname)}", unsafe_allow_html=True)
             if cols[1].button("Accept", key=f"acc_{rid}"):
                 update_request_status(rid, "accepted"); st.cache_data.clear()
             if cols[2].button("Decline", key=f"dec_{rid}"):
@@ -343,8 +400,9 @@ with col_left:
             st.caption("None")
         for req in outgoing:
             to_id = req["addressee_id"]
-            uname = usernames_for_ids([to_id]).get(to_id, to_id[:8])
-            st.caption(f"Sent to @{uname} (pending)")
+            prof = profiles_for_ids([to_id]).get(to_id, {})
+            uname = prof.get("username") or to_id[:8]
+            st.caption(f"{avatar_img(prof.get('avatar_url'), 16)} Sent to @{py_html.escape(uname)} (pending)", unsafe_allow_html=True)
 
     # Quick DM from friends
     with st.expander("Friends"):
@@ -356,7 +414,10 @@ with col_left:
                 fid = f["id"]
                 label = f.get("full_name") or f.get("username") or fid[:8]
                 cols = st.columns([2,1])
-                cols[0].markdown(f"**{label}**  \n`@{f.get('username') or fid[:8]}`")
+                cols[0].markdown(
+                    f"{avatar_img(f.get('avatar_url'), 24)} **{py_html.escape(label)}**  \n`@{py_html.escape(f.get('username') or fid[:8])}`",
+                    unsafe_allow_html=True
+                )
                 if cols[1].button("DM", key=f"dm_{fid}"):
                     try:
                         convo_id = get_or_create_conversation(fid)
@@ -390,48 +451,55 @@ with col_left:
     st.markdown("---")
 
     # Conversation list (DMs + Groups)
-convs = my_conversations()
-if not convs:
-    st.caption("No conversations yet.")
-else:
-    # who’s in each convo → map user_id -> @username
-    all_member_ids = {u for c in convs for u in c.get("members", [])}
-    uname_map = usernames_for_ids(all_member_ids)
+    convs = my_conversations()
+    st.markdown("**Your conversations**")
+    if not convs:
+        st.caption("No conversations yet.")
+    else:
+        all_member_ids = {u for c in convs for u in c.get("members", [])}
+        uname_map = usernames_for_ids(all_member_ids)
+        prof_map = profiles_for_ids(list(all_member_ids))
+        conv_options = {}
+        for c in convs:
+            conv_options[c["id"]] = f"{convo_label_with_avatar(c, uname_map, prof_map)} · {c['id'][:6]}"
 
-    # ALWAYS use the smart labeler, then append a short id to guarantee uniqueness
-    conv_options = {}
-    for c in convs:
-        base = convo_label(c, uname_map)  # shows @other for DM, group title or member list for groups
-        conv_options[c["id"]] = f"{base} · {c['id'][:6]}"
+        conv_ids = list(conv_options.keys())
+        current = st.session_state.get("current_convo")
+        default_index = conv_ids.index(current) if current in conv_ids else 0
 
-    conv_ids = list(conv_options.keys())
-    current = st.session_state.get("current_convo")
-    default_index = conv_ids.index(current) if current in conv_ids else 0
+        # selectbox can't render HTML; we show a plain label in the select and pretty HTML below it
+        def _plain_label(cid: str) -> str:
+            # strip tags for the selectbox display
+            import re as _re
+            return _re.sub(r"<[^>]+>", "", conv_options.get(cid, cid[:8]))
 
-    selected_convo_id = st.selectbox(
-        "Open",
-        conv_ids,
-        index=default_index if conv_ids else 0,
-        format_func=lambda cid: conv_options.get(cid, cid[:8]),
-        key="select_convo",
-    )
-    st.session_state["current_convo"] = selected_convo_id
+        selected_convo_id = st.selectbox(
+            "Open",
+            conv_ids,
+            index=default_index if conv_ids else 0,
+            format_func=_plain_label,
+            key="select_convo",
+        )
+        st.session_state["current_convo"] = selected_convo_id
 
-    if st.button("Refresh"):
-        st.cache_data.clear()
+        st.markdown(conv_options.get(selected_convo_id, selected_convo_id[:8]), unsafe_allow_html=True)
+
+        if st.button("Refresh"):
+            st.cache_data.clear()
 
 # ---------- Center: Messages ----------
 with col_main:
     st.subheader("💬 Messages")
     current_convo = st.session_state.get("current_convo")
     if not current_convo:
-        st.caption("Pick a friend or conversation from the left.")
+        st.caption("Pick a conversation from the left.")
         st.stop()
 
     # Load from DB then merge with optimistic
     server_msgs = load_messages(current_convo)
     msgs = combined_messages(current_convo, server_msgs)
     id_map = usernames_for_ids({m["sender_id"] for m in msgs} | {me})
+    sender_profiles = profiles_for_ids(list({m["sender_id"] for m in msgs}))
 
     # Scrollable messages panel (HTML iframe)
     st.markdown("**Thread**")
@@ -442,13 +510,20 @@ with col_main:
         ts = datetime.fromisoformat(m["created_at"].replace("Z", "+00:00"))\
              .astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         status = m.get("status")
-        badge = "⏳ sending" if status == "sending" else ("✅ sent" if status == "sent" else ("⚠️ failed" if status == "failed" else ""))
+        badge_text = "⏳ sending" if status == "sending" else ("✅ sent" if status == "sent" else ("⚠️ failed" if status == "failed" else ""))
+        badge_html = f"<span class='badge'>{badge_text}</span>" if badge_text else ""
         bubble = "🟦" if mine else "🟨"
+        avatar_url = sender_profiles.get(m["sender_id"], {}).get("avatar_url") or ""
 
         items.append(f"""
           <div class="msg {'mine' if mine else 'theirs'}">
-            <div class="meta">{bubble} <strong>{py_html.escape(who)}</strong> · {py_html.escape(ts)}{' · <span class="badge">'+badge+'</span>' if badge else ''}</div>
-            <div class="body">{py_html.escape(m['content'] or '')}</div>
+            <div class="row">
+              <img src="{py_html.escape(avatar_url)}" class="avatar"/>
+              <div class="content">
+                <div class="meta">{bubble} <strong>{py_html.escape(who)}</strong> · {py_html.escape(ts)} {badge_html}</div>
+                <div class="body">{py_html.escape(m['content'] or '')}</div>
+              </div>
+            </div>
           </div>
         """)
 
@@ -470,13 +545,15 @@ with col_main:
   }}
   .msg {{ padding: 8px 0; border-bottom: 1px solid #eee; }}
   .msg:last-child {{ border-bottom: none; }}
+  .row {{ display: flex; gap: 10px; align-items: flex-start; }}
+  .avatar {{ width: 28px; height: 28px; border-radius: 50%; object-fit: cover; border: 1px solid #eee; }}
+  .content {{ flex: 1; }}
   .meta {{ font-size: 12px; color: #555; margin-bottom: 4px; }}
   .body {{ white-space: pre-wrap; word-wrap: break-word; }}
   .mine .meta {{ color: #245; }}
   .theirs .meta {{ color: #542; }}
   .badge {{
-    display:inline-block; padding:0 6px; font-size:11px; border-radius:999px;
-    background:#f1f1f1; color:#333;
+    display:inline-block; padding:0 6px; font-size:11px; border-radius:999px; background:#f1f1f1; color:#333; margin-left:6px;
   }}
 </style>
 </head>
@@ -499,10 +576,31 @@ with col_main:
         text = st.text_area("Message", placeholder=placeholder, height=80, max_chars=2000, key="composer_text")
         sent = st.form_submit_button("Send", type="primary")
         if sent and text.strip():
-            # show immediately
-            temp = add_optimistic_message(current_convo, me, text.strip())
-            # write to DB
-            ok = send_message_to_db(current_convo, text)
+            temp = add_optimistic_message(current_convo, me, text.strip())  # show instantly
+            ok = send_message_to_db(current_convo, text)                    # persist
             mark_optimistic(current_convo, temp["id"], "sent" if ok else "failed")
-            # reload caches so the next interaction shows server-canonical
             st.cache_data.clear()
+
+# ---------- Right: Profile ----------
+with col_right:
+    st.subheader("🙍 Profile")
+
+    st.markdown(
+        f"{avatar_img(profile.get('avatar_url'), 64)} "
+        f"<span style='font-size:18px;vertical-align:middle;margin-left:8px;'>@{py_html.escape(profile['username'])}</span>",
+        unsafe_allow_html=True,
+    )
+
+    st.caption("Update your profile photo:")
+    up = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=False)
+    if up is not None:
+        data = up.read()
+        if len(data) > 0:
+            try:
+                url = upload_avatar_to_storage(auth, me, data, up.type or "image/png")
+                auth.table("profiles").update({"avatar_url": url}).eq("id", me).execute()
+                st.success("Avatar updated!")
+                profile["avatar_url"] = url
+                st.cache_data.clear()
+            except Exception as e:
+                st.error(f"Upload failed: {e}")
