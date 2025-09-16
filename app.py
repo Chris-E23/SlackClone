@@ -353,4 +353,4 @@ with tabs[2]:
             send_message(convo_id, text)
             time.sleep(0.1)
             st.cache_data.clear()
-            st.experimental_rerun()
+            #st.experimental_rerun()
