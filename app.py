@@ -1,6 +1,7 @@
 # pages/10_Friends_and_Messages.py
 import os
 import re
+import uuid
 import random
 import time
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ from postgrest import APIError
 from streamlit_supabase_auth import login_form, logout_button
 
 # ----------------------------
-# Config & clients
+# Config & base client
 # ----------------------------
 st.set_page_config(page_title="Friends & Messages", page_icon="💬", layout="wide")
 st.title("💬 Friends & Messages")
@@ -57,7 +58,7 @@ def authed_client(access_token: str, refresh_token: str):
 auth = authed_client(access_token, refresh_token)
 
 # ----------------------------
-# Username bootstrap (unique)
+# Unique username bootstrap
 # ----------------------------
 def _slugify(s: str, fallback: str) -> str:
     if not s:
@@ -123,7 +124,71 @@ profile = ensure_profile_with_username(auth, me, user.get("user_metadata", {}) o
 st.info(f"Signed in as **@{profile['username']}**")
 
 # ----------------------------
-# Helpers (friends & chat)
+# Optimistic messaging state
+# ----------------------------
+if "optimistic" not in st.session_state:
+    # { conversation_id: [ {id, sender_id, content, created_at, status} ] }
+    st.session_state["optimistic"] = {}
+
+def _optimistic_list(cid: str):
+    return st.session_state["optimistic"].setdefault(cid, [])
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def add_optimistic_message(cid: str, sender_id: str, content: str):
+    temp = {
+        "id": f"tmp-{uuid.uuid4()}",
+        "sender_id": sender_id,
+        "content": content,
+        "created_at": _now_iso(),
+        "status": "sending",  # sending | sent | failed
+    }
+    _optimistic_list(cid).append(temp)
+    return temp
+
+def mark_optimistic(cid: str, temp_id: str, new_status: str):
+    lst = _optimistic_list(cid)
+    for m in lst:
+        if m["id"] == temp_id:
+            m["status"] = new_status
+            return
+
+def drop_delivered_optimistic(cid: str, server_msgs: list):
+    """
+    Hide optimistic copies once an equivalent server message appears.
+    Heuristic: same sender + same content within 10s.
+    """
+    lst = _optimistic_list(cid)
+    keep = []
+    for om in lst:
+        if om["status"] == "failed":
+            keep.append(om)
+            continue
+        om_ts = datetime.fromisoformat(om["created_at"].replace("Z", "+00:00"))
+        matched = False
+        for sm in server_msgs:
+            if sm["sender_id"] != om["sender_id"]:
+                continue
+            if (sm["content"] or "").strip() != (om["content"] or "").strip():
+                continue
+            sm_ts = datetime.fromisoformat(sm["created_at"].replace("Z", "+00:00"))
+            if abs((sm_ts - om_ts).total_seconds()) <= 10:
+                matched = True
+                break
+        if not matched:
+            keep.append(om)
+    st.session_state["optimistic"][cid] = keep
+
+def combined_messages(cid: str, server_msgs: list):
+    drop_delivered_optimistic(cid, server_msgs)
+    merged = list(server_msgs) + list(_optimistic_list(cid))
+    def _ts(m):
+        return datetime.fromisoformat(m["created_at"].replace("Z", "+00:00"))
+    return sorted(merged, key=_ts)
+
+# ----------------------------
+# Helpers: friends & chat
 # ----------------------------
 @st.cache_data(ttl=10)
 def search_users(query: str):
@@ -173,7 +238,7 @@ def send_friend_request(other_id: str):
         st.warning("You can’t add yourself.")
         return
     try:
-        # Idempotent; accepts automatically if they already requested you
+        # Idempotent; auto-accepts if reverse request exists
         auth.rpc("upsert_friend_request", {"a": me, "b": other_id}).execute()
     except APIError:
         st.error("Could not add friend (check RLS / grants).")
@@ -195,7 +260,7 @@ def get_or_create_conversation(other_id: str) -> str:
         return resp.data
     except APIError:
         st.error(
-            "Couldn’t open/create the conversation. Make sure the RPC is SECURITY DEFINER, "
+            "Couldn’t open/create the conversation. Ensure the RPC is SECURITY DEFINER, "
             "in schema public, and FORCE RLS is OFF on conversation_participants."
         )
         raise
@@ -206,18 +271,16 @@ def load_messages(conversation_id: str, limit: int = 200):
         .eq("conversation_id", conversation_id).order("created_at").limit(limit).execute()
     return res.data or []
 
-def send_message(conversation_id: str, text: str):
-    text = (text or "").strip()
-    if not text:
-        return
+def send_message_to_db(conversation_id: str, text: str) -> bool:
     try:
         auth.table("direct_messages").insert({
             "conversation_id": conversation_id,
             "sender_id": me,
-            "content": text
+            "content": text.strip()
         }).execute()
+        return True
     except APIError:
-        st.error("Failed to send message (RLS or grants).")
+        return False
 
 # ----------------------------
 # UI
@@ -296,7 +359,6 @@ with tabs[2]:
         st.caption("No accepted friends yet — add some from the Find Users tab.")
         st.stop()
 
-    # Picker for accepted friends
     friend_label_map = {f["id"]: (f.get("full_name") or f.get("username") or f["id"][:8]) for f in friends}
     friend_ids = [fid for fid in friend_label_map.keys() if fid != me]
     if not friend_ids:
@@ -315,7 +377,7 @@ with tabs[2]:
     )
     st.session_state["chat_with"] = selected_id
 
-    # Conversation
+    # Conversation id
     try:
         convo_id = get_or_create_conversation(selected_id)
     except Exception:
@@ -328,7 +390,21 @@ with tabs[2]:
         if st.button("Refresh"):
             st.cache_data.clear()
 
-    msgs = load_messages(convo_id)
+    # Server messages first
+    server_msgs = load_messages(convo_id)
+
+    # Composer with optimistic send
+    with st.form("composer", clear_on_submit=True):
+        text = st.text_area("Message", placeholder="Type a message…", height=80, max_chars=2000, key="composer_text")
+        sent = st.form_submit_button("Send", type="primary")
+        if sent and text.strip():
+            tmp = add_optimistic_message(convo_id, me, text.strip())  # show immediately
+            ok = send_message_to_db(convo_id, text)                    # push to DB
+            mark_optimistic(convo_id, tmp["id"], "sent" if ok else "failed")
+            st.cache_data.clear()                                      # next render can show server echo
+
+    # Merge server + optimistic for display
+    msgs = combined_messages(convo_id, server_msgs)
     id_map = usernames_for_ids({m["sender_id"] for m in msgs} | {me, selected_id})
 
     st.divider()
@@ -339,18 +415,26 @@ with tabs[2]:
     for m in msgs:
         mine = (m["sender_id"] == me)
         who = "You" if mine else f"@{id_map.get(m['sender_id'], m['sender_id'][:8])}"
-        ts = datetime.fromisoformat(m["created_at"].replace("Z","+00:00"))\
+        ts = datetime.fromisoformat(m["created_at"].replace("Z", "+00:00"))\
              .astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         bubble = "🟦" if mine else "🟨"
-        st.markdown(f"{bubble} **{who}** · {ts}\n\n{m['content']}")
-        st.write("---")
+        status = m.get("status")  # only for optimistic entries
+        badge = " ⏳" if status == "sending" else (" ✅" if status == "sent" else (" ⚠️" if status == "failed" else ""))
 
-    # Composer
-    with st.form("composer", clear_on_submit=True):
-        text = st.text_area("Message", placeholder="Type a message…", height=80, max_chars=2000)
-        sent = st.form_submit_button("Send", type="primary")
-        if sent and text.strip():
-            send_message(convo_id, text)
-            time.sleep(0.1)
-            st.cache_data.clear()
-            #st.experimental_rerun()
+        st.markdown(f"{bubble} **{who}** · {ts}{badge}\n\n{m['content']}")
+
+        if status == "failed" and mine:
+            cols2 = st.columns([1,1,6])
+            with cols2[0]:
+                if st.button("Retry", key=f"retry_{m['id']}"):
+                    ok = send_message_to_db(convo_id, m["content"])
+                    mark_optimistic(convo_id, m["id"], "sent" if ok else "failed")
+                    st.cache_data.clear()
+            with cols2[1]:
+                if st.button("Dismiss", key=f"dismiss_{m['id']}"):
+                    # remove this optimistic message
+                    lst = _optimistic_list(convo_id)
+                    st.session_state["optimistic"][convo_id] = [x for x in lst if x["id"] != m["id"]]
+                    st.cache_data.clear()
+
+        st.write("---")
