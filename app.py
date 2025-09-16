@@ -390,34 +390,35 @@ with col_left:
     st.markdown("---")
 
     # Conversation list (DMs + Groups)
-    convs = my_conversations()
-    st.markdown("**Your conversations**")
-    if not convs:
-        st.caption("No conversations yet.")
-    else:
-        all_member_ids = {u for c in convs for u in c.get("members", [])}
-        uname_map = usernames_for_ids(all_member_ids)
-        conv_options = {c["id"]: (f"{'👥' if c.get('is_group') else '💬'} { (c.get('title') or '').strip() or '' }".strip() or None) for c in convs}
-        # fallback to smart label if title blank
-        for c in convs:
-            if not conv_options[c["id"]]:
-                conv_options[c["id"]] = convo_label(c, uname_map)
+convs = my_conversations()
+if not convs:
+    st.caption("No conversations yet.")
+else:
+    # who’s in each convo → map user_id -> @username
+    all_member_ids = {u for c in convs for u in c.get("members", [])}
+    uname_map = usernames_for_ids(all_member_ids)
 
-        conv_ids = list(conv_options.keys())
-        current = st.session_state.get("current_convo")
-        default_index = conv_ids.index(current) if current in conv_ids else 0
+    # ALWAYS use the smart labeler, then append a short id to guarantee uniqueness
+    conv_options = {}
+    for c in convs:
+        base = convo_label(c, uname_map)  # shows @other for DM, group title or member list for groups
+        conv_options[c["id"]] = f"{base} · {c['id'][:6]}"
 
-        selected_convo_id = st.selectbox(
-            "Open",
-            conv_ids,
-            index=default_index if conv_ids else 0,
-            format_func=lambda cid: conv_options.get(cid, cid[:8]),
-            key="select_convo",
-        )
-        st.session_state["current_convo"] = selected_convo_id
+    conv_ids = list(conv_options.keys())
+    current = st.session_state.get("current_convo")
+    default_index = conv_ids.index(current) if current in conv_ids else 0
 
-        if st.button("Refresh"):
-            st.cache_data.clear()
+    selected_convo_id = st.selectbox(
+        "Open",
+        conv_ids,
+        index=default_index if conv_ids else 0,
+        format_func=lambda cid: conv_options.get(cid, cid[:8]),
+        key="select_convo",
+    )
+    st.session_state["current_convo"] = selected_convo_id
+
+    if st.button("Refresh"):
+        st.cache_data.clear()
 
 # ---------- Center: Messages ----------
 with col_main:
