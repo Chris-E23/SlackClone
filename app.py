@@ -1,4 +1,4 @@
-# pages/10_Friends_and_Messages.py
+#!/usr/bin/env python3
 import os
 import re
 import uuid
@@ -10,12 +10,28 @@ import streamlit as st
 from supabase import create_client
 from postgrest import APIError
 from streamlit_supabase_auth import login_form, logout_button
+from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
 
 # ----------------------------
-# Config & base client
+# Config
 # ----------------------------
 st.set_page_config(page_title="Friends & Messages", page_icon="💬", layout="wide")
 st.title("💬 Friends & Messages")
+st_autorefresh(interval=5000, key="chat_autorefresh")  # auto-refresh every 5s
+
+# Scrollable chat box style
+st.markdown("""
+    <style>
+    .chat-box {
+        max-height: 400px;
+        overflow-y: auto;
+        padding: 0.5rem;
+        border: 1px solid #ddd;
+        border-radius: 0.5rem;
+        background-color: #fafafa;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
@@ -56,21 +72,6 @@ def authed_client(access_token: str, refresh_token: str):
     return cli
 
 auth = authed_client(access_token, refresh_token)
-
-
-st.markdown("""
-    <style>
-    .chat-box {
-        max-height: 400px; /* adjust height */
-        overflow-y: auto;
-        padding: 0.5rem;
-        border: 1px solid #ddd;
-        border-radius: 0.5rem;
-        background-color: #fafafa;
-    }
-    </style>
-""", unsafe_allow_html=True)
-
 
 # ----------------------------
 # Unique username bootstrap
@@ -142,8 +143,7 @@ st.info(f"Signed in as **@{profile['username']}**")
 # Optimistic messaging state
 # ----------------------------
 if "optimistic" not in st.session_state:
-    # { conversation_id: [ {id, sender_id, content, created_at, status} ] }
-    st.session_state["optimistic"] = {}
+    st.session_state["optimistic"] = {}  # { conversation_id: [ ... ] }
 
 def _optimistic_list(cid: str):
     return st.session_state["optimistic"].setdefault(cid, [])
@@ -157,7 +157,7 @@ def add_optimistic_message(cid: str, sender_id: str, content: str):
         "sender_id": sender_id,
         "content": content,
         "created_at": _now_iso(),
-        "status": "sending",  # sending | sent | failed
+        "status": "sending",
     }
     _optimistic_list(cid).append(temp)
     return temp
@@ -182,7 +182,7 @@ def drop_delivered_optimistic(cid: str, server_msgs: list):
                 continue
             if (sm["content"] or "").strip() != (om["content"] or "").strip():
                 continue
-            sm_ts = datetime.fromisoformat(sm["created_at"].replace("Z", "+00:00"))
+            sm_ts = datetime.fromisoformat(sm["created_at"].replace("Z","+00:00"))
             if abs((sm_ts - om_ts).total_seconds()) <= 10:
                 matched = True; break
         if not matched: keep.append(om)
@@ -191,11 +191,11 @@ def drop_delivered_optimistic(cid: str, server_msgs: list):
 def combined_messages(cid: str, server_msgs: list):
     drop_delivered_optimistic(cid, server_msgs)
     merged = list(server_msgs) + list(_optimistic_list(cid))
-    def _ts(m): return datetime.fromisoformat(m["created_at"].replace("Z", "+00:00"))
+    def _ts(m): return datetime.fromisoformat(m["created_at"].replace("Z","+00:00"))
     return sorted(merged, key=_ts)
 
 # ----------------------------
-# Helpers: friends, conversations, chat
+# Helpers
 # ----------------------------
 @st.cache_data(ttl=10)
 def search_users(query: str):
@@ -216,9 +216,7 @@ def my_friend_requests():
 def my_friends():
     acc1 = auth.table("friends").select("requester_id, addressee_id").eq("requester_id", me).eq("status", "accepted").execute().data or []
     acc2 = auth.table("friends").select("requester_id, addressee_id").eq("addressee_id", me).eq("status", "accepted").execute().data or []
-    ids = set()
-    for r in acc1: ids.add(r["addressee_id"])
-    for r in acc2: ids.add(r["requester_id"])
+    ids = {r["addressee_id"] for r in acc1} | {r["requester_id"] for r in acc2}
     ids.discard(me)
     if not ids: return []
     return auth.table("profiles").select("id, username, full_name, avatar_url").in_("id", list(ids)).execute().data or []
@@ -247,23 +245,14 @@ def get_or_create_conversation(other_id: str) -> str:
     if other_id == me:
         st.error("You can’t start a conversation with yourself.")
         raise RuntimeError("self-conversation blocked in UI")
-    try:
-        resp = auth.rpc("get_or_create_conversation", {"a": me, "b": other_id}).execute()
-        if not resp.data: raise RuntimeError("RPC returned no data")
-        return resp.data
-    except APIError:
-        st.error("Couldn’t open/create the DM. Ensure RPC is SECURITY DEFINER & RLS sane.")
-        raise
+    resp = auth.rpc("get_or_create_conversation", {"a": me, "b": other_id}).execute()
+    if not resp.data: raise RuntimeError("RPC returned no data")
+    return resp.data
 
 def create_group(others: list[str], title: str) -> str:
-    # others: list of friend user_ids, must include at least 2 (total 3+ with me)
-    try:
-        resp = auth.rpc("create_group_conversation", {"creator": me, "members": others, "conv_title": title}).execute()
-        if not resp.data: raise RuntimeError("RPC returned no data")
-        return resp.data
-    except APIError as e:
-        st.error("Failed to create group (need 2+ others; check RPC/permissions).")
-        raise
+    resp = auth.rpc("create_group_conversation", {"creator": me, "members": others, "conv_title": title}).execute()
+    if not resp.data: raise RuntimeError("RPC returned no data")
+    return resp.data
 
 @st.cache_data(ttl=2)
 def load_messages(conversation_id: str, limit: int = 200):
@@ -284,39 +273,30 @@ def send_message_to_db(conversation_id: str, text: str) -> bool:
 
 @st.cache_data(ttl=5)
 def my_conversations():
-    """
-    Return all conversations I participate in, with minimal info and member ids.
-    """
-    # First, get my conv ids from participants
     cps = auth.table("conversation_participants").select("conversation_id")\
         .eq("user_id", me).execute().data or []
     conv_ids = [c["conversation_id"] for c in cps]
-    if not conv_ids:
-        return []
-
+    if not conv_ids: return []
     convs = auth.table("conversations").select("id, title, is_group, created_at, creator_id")\
         .in_("id", conv_ids).order("created_at", desc=True).execute().data or []
-
-    # fetch members for labels
     members = auth.table("conversation_participants").select("conversation_id, user_id")\
         .in_("conversation_id", conv_ids).execute().data or []
-    # map conv -> members
     byconv = {}
-    for m in members:
-        byconv.setdefault(m["conversation_id"], []).append(m["user_id"])
-    # attach
-    for c in convs:
-        c["members"] = byconv.get(c["id"], [])
+    for m in members: byconv.setdefault(m["conversation_id"], []).append(m["user_id"])
+    for c in convs: c["members"] = byconv.get(c["id"], [])
     return convs
 
 def convo_label(convo, usernames_map):
-    if convo["is_group"]:
-        name = convo.get("title") or "Untitled group"
-        return f"👥 {name}"
-    # DM: show the other person's handle
+    if convo.get("is_group"):
+        name = (convo.get("title") or "").strip()
+        if name:
+            return f"👥 {name}"
+        others = [u for u in convo.get("members", []) if u != me]
+        handles = [f"@{usernames_map.get(u, u[:8])}" for u in others][:3]
+        tail = "" if len(others) <= 3 else f" +{len(others)-3}"
+        return "👥 " + ", ".join(handles) + tail
     others = [u for u in convo.get("members", []) if u != me]
-    if not others:
-        return "DM"
+    if not others: return "DM"
     other = others[0]
     handle = usernames_map.get(other, other[:8])
     return f"💬 @{handle}"
@@ -326,24 +306,23 @@ def convo_label(convo, usernames_map):
 # ----------------------------
 tabs = st.tabs(["Find Users", "Friend Requests", "Conversations"])
 
-# --- Find Users (send requests)
+# --- Find Users
 with tabs[0]:
     st.subheader("Find Users")
     q = st.text_input("Search by username or full name", "", placeholder="e.g. chris, jane doe")
     results = search_users(q) if q else []
-    if results:
-        for r in results:
-            if r["id"] == me: continue
-            col1, col2 = st.columns([3,1])
-            with col1:
-                name = r.get("full_name") or r.get("username") or r["id"][:8]
-                handle = r.get("username") or r["id"][:8]
-                st.write(f"**{name}**  \n`@{handle}`")
-            with col2:
-                if st.button("Add Friend", key=f"add_{r['id']}"):
-                    send_friend_request(r["id"])
-                    st.success("Friend added (pending until accepted).")
-                    st.cache_data.clear()
+    for r in results:
+        if r["id"] == me: continue
+        col1, col2 = st.columns([3,1])
+        with col1:
+            name = r.get("full_name") or r.get("username") or r["id"][:8]
+            handle = r.get("username") or r["id"][:8]
+            st.write(f"**{name}**  \n`@{handle}`")
+        with col2:
+            if st.button("Add Friend", key=f"add_{r['id']}"):
+                send_friend_request(r["id"])
+                st.success("Friend added (pending until accepted).")
+                st.cache_data.clear()
 
 # --- Friend Requests
 with tabs[1]:
@@ -374,15 +353,14 @@ with tabs[1]:
         uname = (prof[0]["username"] if prof else to_id[:8])
         st.write(f"Sent to **{name}**  (`@{uname}`) — *pending*")
 
-# --- Conversations (DMs + Groups)
+# --- Conversations
 with tabs[2]:
     st.subheader("Conversations")
 
-    # New Group Chat
+    # Create Group
     st.markdown("### New Group")
     friends = my_friends()
     if friends:
-        # Choose at least 2 friends
         friend_id_to_label = {f["id"]: (f.get("full_name") or f.get("username") or f["id"][:8]) for f in friends}
         chosen = st.multiselect(
             "Add members (choose at least 2):",
@@ -396,33 +374,34 @@ with tabs[2]:
                 st.success("Group created!")
                 st.cache_data.clear()
                 st.session_state["current_convo"] = convo_id
-            except Exception:
-                pass
+            except Exception: pass
     else:
         st.caption("Add some friends first to create a group.")
 
     st.markdown("---")
 
-    # List all my conversations
+    # Conversation list
     convs = my_conversations()
     if not convs:
-        st.caption("No conversations yet. Start a DM from Find Users or create a group above.")
+        st.caption("No conversations yet.")
+        st.stop()
+    all_member_ids = {u for c in convs for u in c.get("members", [])}
+    uname_map = usernames_for_ids(all_member_ids)
+       # Conversation list
+    convs = my_conversations()
+    if not convs:
+        st.caption("No conversations yet.")
         st.stop()
 
-    # Build label map
-    # Pre-fetch usernames for all member ids to build labels quickly
-    all_member_ids = set()
-    for c in convs:
-        for uid in c.get("members", []):
-            all_member_ids.add(uid)
+    all_member_ids = {u for c in convs for u in c.get("members", [])}
     uname_map = usernames_for_ids(all_member_ids)
 
     conv_options = {c["id"]: convo_label(c, uname_map) for c in convs}
+    conv_ids = list(conv_options.keys())
 
-    # pick current conversation
+    # Persist selection
     current = st.session_state.get("current_convo")
     default_index = 0
-    conv_ids = list(conv_options.keys())
     if current in conv_ids:
         default_index = conv_ids.index(current)
 
@@ -430,12 +409,12 @@ with tabs[2]:
         "Open a conversation",
         conv_ids,
         index=default_index,
-        format_func=lambda cid: conv_options.get(cid, cid[:8])
+        format_func=lambda cid: conv_options.get(cid, cid[:8]),
+        key="select_convo",
     )
     st.session_state["current_convo"] = selected_convo_id
 
-    # Conversation header
-    conv = next((c for c in convs if c["id"] == selected_convo_id), None)
+    # Header
     header_label = conv_options.get(selected_convo_id, selected_convo_id[:8])
     cols = st.columns([4,1])
     with cols[0]:
@@ -444,18 +423,13 @@ with tabs[2]:
         if st.button("Refresh"):
             st.cache_data.clear()
 
-    # Server messages
+    # Load server messages
     server_msgs = load_messages(selected_convo_id)
 
-    # Composer with optimistic send
+    # Composer (optimistic)
     with st.form("composer", clear_on_submit=True):
-        text = st.text_area(
-            "Message",
-            placeholder=("Message group…" if conv and conv.get("is_group") else "Message…"),
-            height=80,
-            max_chars=2000,
-            key="composer_text"
-        )
+        placeholder = "Message group…" if any(c["id"] == selected_convo_id and c.get("is_group") for c in convs) else "Message…"
+        text = st.text_area("Message", placeholder=placeholder, height=80, max_chars=2000, key="composer_text")
         sent = st.form_submit_button("Send", type="primary")
         if sent and text.strip():
             tmp = add_optimistic_message(selected_convo_id, me, text.strip())
@@ -463,41 +437,43 @@ with tabs[2]:
             mark_optimistic(selected_convo_id, tmp["id"], "sent" if ok else "failed")
             st.cache_data.clear()
 
-    # Merge server + optimistic and render
+    # Merge for display
     msgs = combined_messages(selected_convo_id, server_msgs)
     id_map = usernames_for_ids({m["sender_id"] for m in msgs} | {me})
 
-st.divider()
-st.markdown("**Messages**")
+    st.divider()
+    st.markdown("**Messages**")
 
-with st.container():
-    st.markdown('<div class="chat-box">', unsafe_allow_html=True)
+    # Scrollable container
+    with st.container():
+        st.markdown('<div class="chat-box">', unsafe_allow_html=True)
 
-    if not msgs:
-        st.caption("No messages yet. Say hi!")
-    for m in msgs:
-        mine = (m["sender_id"] == me)
-        who = "You" if mine else f"@{id_map.get(m['sender_id'], m['sender_id'][:8])}"
-        ts = datetime.fromisoformat(m["created_at"].replace("Z", "+00:00"))\
-             .astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        bubble = "🟦" if mine else "🟨"
-        status = m.get("status")
-        badge = " ⏳" if status == "sending" else (" ✅" if status == "sent" else (" ⚠️" if status == "failed" else ""))
+        if not msgs:
+            st.caption("No messages yet. Say hi!")
+        for m in msgs:
+            mine = (m["sender_id"] == me)
+            who = "You" if mine else f"@{id_map.get(m['sender_id'], m['sender_id'][:8])}"
+            ts = datetime.fromisoformat(m["created_at"].replace("Z", "+00:00"))\
+                 .astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            bubble = "🟦" if mine else "🟨"
+            status = m.get("status")
+            badge = " ⏳" if status == "sending" else (" ✅" if status == "sent" else (" ⚠️" if status == "failed" else ""))
 
-        st.markdown(f"{bubble} **{who}** · {ts}{badge}\n\n{m['content']}")
+            st.markdown(f"{bubble} **{who}** · {ts}{badge}\n\n{m['content']}")
 
-        if status == "failed" and mine:
-            cols2 = st.columns([1,1,6])
-            with cols2[0]:
-                if st.button("Retry", key=f"retry_{m['id']}"):
-                    ok = send_message_to_db(selected_convo_id, m["content"])
-                    mark_optimistic(selected_convo_id, m["id"], "sent" if ok else "failed")
-                    st.cache_data.clear()
-            with cols2[1]:
-                if st.button("Dismiss", key=f"dismiss_{m['id']}"):
-                    lst = _optimistic_list(selected_convo_id)
-                    st.session_state["optimistic"][selected_convo_id] = [x for x in lst if x["id"] != m["id"]]
-                    st.cache_data.clear()
-        st.write("---")
+            if status == "failed" and mine:
+                cols2 = st.columns([1,1,6])
+                with cols2[0]:
+                    if st.button("Retry", key=f"retry_{m['id']}"):
+                        ok = send_message_to_db(selected_convo_id, m["content"])
+                        mark_optimistic(selected_convo_id, m["id"], "sent" if ok else "failed")
+                        st.cache_data.clear()
+                with cols2[1]:
+                    if st.button("Dismiss", key=f"dismiss_{m['id']}"):
+                        lst = _optimistic_list(selected_convo_id)
+                        st.session_state["optimistic"][selected_convo_id] = [x for x in lst if x["id"] != m["id"]]
+                        st.cache_data.clear()
 
-    st.markdown('</div>', unsafe_allow_html=True)
+            st.write("---")
+
+        st.markdown('</div>', unsafe_allow_html=True)
