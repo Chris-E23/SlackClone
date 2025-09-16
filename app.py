@@ -1,6 +1,7 @@
 # pages/10_Friends_and_Messages.py
 import os
 import re
+import uuid
 import random
 import time
 from datetime import datetime, timezone
@@ -9,12 +10,16 @@ import streamlit as st
 from supabase import create_client
 from postgrest import APIError
 from streamlit_supabase_auth import login_form, logout_button
+from streamlit_autorefresh import st_autorefresh  # auto-refresh
 
 # ----------------------------
-# Config & clients
+# Config & base client
 # ----------------------------
 st.set_page_config(page_title="Friends & Messages", page_icon="💬", layout="wide")
 st.title("💬 Friends & Messages")
+
+# Auto-refresh every 5 seconds (adjust interval as needed)
+st_autorefresh(interval=5000, key="chat_autorefresh")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
@@ -29,30 +34,23 @@ def base_client():
 supabase = base_client()
 
 # ----------------------------
-# Auth: get or create session
+# Auth
 # ----------------------------
 session = st.session_state.get("session")
-
 if not session:
     st.info("Please sign in to use friends and messaging.")
-    session = login_form(
-        url=SUPABASE_URL,
-        apiKey=SUPABASE_ANON_KEY,
-        providers=["github"]
-    )
+    session = login_form(url=SUPABASE_URL, apiKey=SUPABASE_ANON_KEY, providers=["github"])
     if session:
         st.session_state["session"] = session
 
 if not session or not session.get("user"):
     st.stop()
 
-# Session fields
 user = session["user"]
 me = user["id"]
 access_token = session.get("access_token")
 refresh_token = session.get("refresh_token", "")
 
-# Optional: logout
 logout_button(apiKey=SUPABASE_ANON_KEY)
 
 @st.cache_resource(show_spinner=False)
@@ -64,13 +62,12 @@ def authed_client(access_token: str, refresh_token: str):
 auth = authed_client(access_token, refresh_token)
 
 # ----------------------------
-# Username bootstrap (unique)
+# Unique username bootstrap
 # ----------------------------
 def _slugify(s: str, fallback: str) -> str:
     if not s:
         return fallback
-    s = s.strip().lower()
-    s = s.replace("-", "_")
+    s = s.strip().lower().replace("-", "_")
     s = re.sub(r"[^a-z0-9_]", "", s)
     s = re.sub(r"_+", "_", s).strip("_")
     return s or fallback
@@ -112,15 +109,13 @@ def ensure_profile_with_username(auth_cli, me: str, user_meta: dict) -> dict:
 
     if not prof:
         handle = _next_available_username(auth_cli, base)
-        full_name = (user_meta or {}).get("full_name")
-        avatar_url = (user_meta or {}).get("avatar_url")
         auth_cli.table("profiles").insert({
             "id": me,
             "username": handle,
-            "full_name": full_name,
-            "avatar_url": avatar_url
+            "full_name": (user_meta or {}).get("full_name"),
+            "avatar_url": (user_meta or {}).get("avatar_url")
         }).execute()
-        return {"id": me, "username": handle, "full_name": full_name, "avatar_url": avatar_url}
+        return {"id": me, "username": handle, "full_name": (user_meta or {}).get("full_name"), "avatar_url": (user_meta or {}).get("avatar_url")}
 
     current = (prof.get("username") or "").strip()
     if not current:
@@ -133,30 +128,85 @@ profile = ensure_profile_with_username(auth, me, user.get("user_metadata", {}) o
 st.info(f"Signed in as **@{profile['username']}**")
 
 # ----------------------------
-# Friends & Messaging helpers
+# Optimistic messaging state
+# ----------------------------
+if "optimistic" not in st.session_state:
+    # { conversation_id: [ {id, sender_id, content, created_at, status} ] }
+    st.session_state["optimistic"] = {}
+
+def _optimistic_list(cid: str):
+    return st.session_state["optimistic"].setdefault(cid, [])
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def add_optimistic_message(cid: str, sender_id: str, content: str):
+    temp = {
+        "id": f"tmp-{uuid.uuid4()}",
+        "sender_id": sender_id,
+        "content": content,
+        "created_at": _now_iso(),
+        "status": "sending",  # sending | sent | failed
+    }
+    _optimistic_list(cid).append(temp)
+    return temp
+
+def mark_optimistic(cid: str, temp_id: str, new_status: str):
+    lst = _optimistic_list(cid)
+    for m in lst:
+        if m["id"] == temp_id:
+            m["status"] = new_status
+            return
+
+def drop_delivered_optimistic(cid: str, server_msgs: list):
+    """
+    Hide optimistic copies once an equivalent server message appears.
+    Heuristic: same sender + same content within 10s.
+    """
+    lst = _optimistic_list(cid)
+    keep = []
+    for om in lst:
+        if om["status"] == "failed":
+            keep.append(om)
+            continue
+        om_ts = datetime.fromisoformat(om["created_at"].replace("Z", "+00:00"))
+        matched = False
+        for sm in server_msgs:
+            if sm["sender_id"] != om["sender_id"]:
+                continue
+            if (sm["content"] or "").strip() != (om["content"] or "").strip():
+                continue
+            sm_ts = datetime.fromisoformat(sm["created_at"].replace("Z", "+00:00"))
+            if abs((sm_ts - om_ts).total_seconds()) <= 10:
+                matched = True
+                break
+        if not matched:
+            keep.append(om)
+    st.session_state["optimistic"][cid] = keep
+
+def combined_messages(cid: str, server_msgs: list):
+    drop_delivered_optimistic(cid, server_msgs)
+    merged = list(server_msgs) + list(_optimistic_list(cid))
+    def _ts(m):
+        return datetime.fromisoformat(m["created_at"].replace("Z", "+00:00"))
+    return sorted(merged, key=_ts)
+
+# ----------------------------
+# Helpers: friends & chat
 # ----------------------------
 @st.cache_data(ttl=10)
 def search_users(query: str):
     if not query:
         return []
-    # NOTE: Supabase .or_ needs a single string with comma-separated conditions.
-    # Do not include extra spaces around commas.
     cond = f"username.ilike.%{query}%,full_name.ilike.%{query}%"
-    res = auth.table("profiles")\
-        .select("id, username, full_name, avatar_url")\
-        .or_(cond)\
-        .neq("id", me)\
-        .limit(20)\
-        .execute()
+    res = auth.table("profiles").select("id, username, full_name, avatar_url").or_(cond).neq("id", me).limit(20).execute()
     return res.data or []
 
 @st.cache_data(ttl=5)
 def my_friend_requests():
-    incoming = auth.table("friends")\
-        .select("id, requester_id, addressee_id, status, created_at")\
+    incoming = auth.table("friends").select("id, requester_id, addressee_id, status, created_at")\
         .eq("addressee_id", me).eq("status", "pending").order("created_at").execute().data or []
-    outgoing = auth.table("friends")\
-        .select("id, requester_id, addressee_id, status, created_at")\
+    outgoing = auth.table("friends").select("id, requester_id, addressee_id, status, created_at")\
         .eq("requester_id", me).eq("status", "pending").order("created_at").execute().data or []
     return incoming, outgoing
 
@@ -167,11 +217,18 @@ def my_friends():
     ids = set()
     for r in acc1: ids.add(r["addressee_id"])
     for r in acc2: ids.add(r["requester_id"])
-    ids.discard(me)  # safety
-    profs = []
-    if ids:
-        profs = auth.table("profiles").select("id, username, full_name, avatar_url").in_("id", list(ids)).execute().data or []
-    return profs
+    ids.discard(me)
+    if not ids:
+        return []
+    return auth.table("profiles").select("id, username, full_name, avatar_url").in_("id", list(ids)).execute().data or []
+
+@st.cache_data(ttl=10)
+def my_added_pending():
+    rows = auth.table("friends").select("addressee_id").eq("requester_id", me).eq("status", "pending").execute().data or []
+    ids = [r["addressee_id"] for r in rows]
+    if not ids:
+        return []
+    return auth.table("profiles").select("id, username, full_name, avatar_url").in_("id", ids).execute().data or []
 
 def usernames_for_ids(ids):
     ids = list(ids or [])
@@ -185,14 +242,10 @@ def send_friend_request(other_id: str):
         st.warning("You can’t add yourself.")
         return
     try:
-        auth.table("friends").insert({
-            "requester_id": me,
-            "addressee_id": other_id,
-            "status": "pending",
-        }).execute()
-    except APIError as e:
-        # Likely unique constraint (duplicate request) or RLS
-        st.error("Could not send request (already sent, already friends, or not allowed).")
+        # Idempotent; auto-accepts if reverse request exists
+        auth.rpc("upsert_friend_request", {"a": me, "b": other_id}).execute()
+    except APIError:
+        st.error("Could not add friend (check RLS / grants).")
 
 def update_request_status(req_id: int, new_status: str):
     try:
@@ -209,39 +262,29 @@ def get_or_create_conversation(other_id: str) -> str:
         if not resp.data:
             raise RuntimeError("RPC returned no data")
         return resp.data
-    except APIError as e:
-        # Most common: function not SECURITY DEFINER or RLS blocking inserts
+    except APIError:
         st.error(
-            "Couldn’t open/create the conversation. "
-            "Confirm the SQL function is SECURITY DEFINER, lives in the public schema, "
-            "and RLS isn’t forced on conversation_participants."
+            "Couldn’t open/create the conversation. Ensure the RPC is SECURITY DEFINER, "
+            "in schema public, and FORCE RLS is OFF on conversation_participants."
         )
-        # Uncomment for local debugging:
-        # st.exception(e)
         raise
 
 @st.cache_data(ttl=2)
 def load_messages(conversation_id: str, limit: int = 200):
-    res = auth.table("direct_messages")\
-        .select("id, sender_id, content, created_at")\
-        .eq("conversation_id", conversation_id)\
-        .order("created_at")\
-        .limit(limit)\
-        .execute()
+    res = auth.table("direct_messages").select("id, sender_id, content, created_at")\
+        .eq("conversation_id", conversation_id).order("created_at").limit(limit).execute()
     return res.data or []
 
-def send_message(conversation_id: str, text: str):
-    text = (text or "").strip()
-    if not text:
-        return
+def send_message_to_db(conversation_id: str, text: str) -> bool:
     try:
         auth.table("direct_messages").insert({
             "conversation_id": conversation_id,
             "sender_id": me,
-            "content": text
+            "content": text.strip()
         }).execute()
+        return True
     except APIError:
-        st.error("Failed to send message (RLS or grants).")
+        return False
 
 # ----------------------------
 # UI
@@ -265,7 +308,7 @@ with tabs[0]:
             with col2:
                 if st.button("Add Friend", key=f"add_{r['id']}"):
                     send_friend_request(r["id"])
-                    st.success("Friend request sent (if allowed).")
+                    st.success("Friend added (pending until accepted).")
                     st.cache_data.clear()
 
 # --- Friend Requests
@@ -306,19 +349,26 @@ with tabs[1]:
 # --- Friends & Chats
 with tabs[2]:
     st.subheader("Friends & Chats")
+
     friends = my_friends()
+    added_pending = my_added_pending()
+
+    if added_pending:
+        with st.expander("Added (pending)"):
+            for p in added_pending:
+                label = p.get("full_name") or p.get("username") or p["id"][:8]
+                st.write(f"⏳ {label} (@{p.get('username') or p['id'][:8]}) — awaiting acceptance")
+
     if not friends:
-        st.caption("No friends yet — add some from the Find Users tab.")
+        st.caption("No accepted friends yet — add some from the Find Users tab.")
         st.stop()
 
-    # Picker
     friend_label_map = {f["id"]: (f.get("full_name") or f.get("username") or f["id"][:8]) for f in friends}
     friend_ids = [fid for fid in friend_label_map.keys() if fid != me]
     if not friend_ids:
         st.caption("No friends available to chat.")
         st.stop()
 
-    # Persist selected friend across reruns
     default_idx = 0
     if "chat_with" in st.session_state and st.session_state["chat_with"] in friend_ids:
         default_idx = friend_ids.index(st.session_state["chat_with"])
@@ -331,7 +381,7 @@ with tabs[2]:
     )
     st.session_state["chat_with"] = selected_id
 
-    # Conversation
+    # Conversation id
     try:
         convo_id = get_or_create_conversation(selected_id)
     except Exception:
@@ -344,7 +394,21 @@ with tabs[2]:
         if st.button("Refresh"):
             st.cache_data.clear()
 
-    msgs = load_messages(convo_id)
+    # Server messages
+    server_msgs = load_messages(convo_id)
+
+    # Composer with optimistic send
+    with st.form("composer", clear_on_submit=True):
+        text = st.text_area("Message", placeholder="Type a message…", height=80, max_chars=2000, key="composer_text")
+        sent = st.form_submit_button("Send", type="primary")
+        if sent and text.strip():
+            tmp = add_optimistic_message(convo_id, me, text.strip())  # show immediately
+            ok = send_message_to_db(convo_id, text)                    # push to DB
+            mark_optimistic(convo_id, tmp["id"], "sent" if ok else "failed")
+            st.cache_data.clear()                                      # next rerun shows server echo
+
+    # Merge server + optimistic for display
+    msgs = combined_messages(convo_id, server_msgs)
     id_map = usernames_for_ids({m["sender_id"] for m in msgs} | {me, selected_id})
 
     st.divider()
@@ -355,18 +419,25 @@ with tabs[2]:
     for m in msgs:
         mine = (m["sender_id"] == me)
         who = "You" if mine else f"@{id_map.get(m['sender_id'], m['sender_id'][:8])}"
-        ts = datetime.fromisoformat(m["created_at"].replace("Z","+00:00"))\
+        ts = datetime.fromisoformat(m["created_at"].replace("Z", "+00:00"))\
              .astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         bubble = "🟦" if mine else "🟨"
-        st.markdown(f"{bubble} **{who}** · {ts}\n\n{m['content']}")
-        st.write("---")
+        status = m.get("status")  # only for optimistic entries
+        badge = " ⏳" if status == "sending" else (" ✅" if status == "sent" else (" ⚠️" if status == "failed" else ""))
 
-    # Composer
-    with st.form("composer", clear_on_submit=True):
-        text = st.text_area("Message", placeholder="Type a message…", height=80, max_chars=2000)
-        sent = st.form_submit_button("Send", type="primary")
-        if sent and text.strip():
-            send_message(convo_id, text)
-            time.sleep(0.1)
-            st.cache_data.clear()
-           # st.experimental_rerun()
+        st.markdown(f"{bubble} **{who}** · {ts}{badge}\n\n{m['content']}")
+
+        if status == "failed" and mine:
+            cols2 = st.columns([1,1,6])
+            with cols2[0]:
+                if st.button("Retry", key=f"retry_{m['id']}"):
+                    ok = send_message_to_db(convo_id, m["content"])
+                    mark_optimistic(convo_id, m["id"], "sent" if ok else "failed")
+                    st.cache_data.clear()
+            with cols2[1]:
+                if st.button("Dismiss", key=f"dismiss_{m['id']}"):
+                    lst = _optimistic_list(convo_id)
+                    st.session_state["optimistic"][convo_id] = [x for x in lst if x["id"] != m["id"]]
+                    st.cache_data.clear()
+
+        st.write("---")
